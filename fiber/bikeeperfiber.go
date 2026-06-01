@@ -409,100 +409,110 @@ func enrichWithHTTPContext(evt *bikeeper.Event, c fiber.Ctx) {
 // Safari, plus the most common desktop and mobile operating systems.
 // No external dependencies — uses string operations only.
 func parseUserAgent(userAgent, secCHUA string) (browserName, browserVersion, clientOSName string) {
-	// ── Browser: prefer Sec-CH-UA brands (Chromium-family, more accurate) ──
-	// Brave, Edge, and Opera all include "Google Chrome" in their brand list,
-	// so we must scan ALL brands and prioritise the most-specific one.
-	// Priority: Brave > Opera > Edge > Google Chrome > (any other non-noise brand)
-	if secCHUA != "" {
-		type brandEntry struct{ name, version string }
-		var brands []brandEntry
-		for _, part := range strings.Split(secCHUA, ",") {
-			part = strings.TrimSpace(part)
-			bStart := strings.Index(part, `"`)
-			if bStart < 0 {
-				continue
-			}
-			bEnd := strings.Index(part[bStart+1:], `"`)
-			if bEnd < 0 {
-				continue
-			}
-			brand := part[bStart+1 : bStart+1+bEnd]
-			// Skip generic noise brands
-			if strings.Contains(brand, "Not") || brand == "Chromium" {
-				continue
-			}
-			vIdx := strings.Index(part, `v="`)
-			if vIdx >= 0 {
-				vRest := part[vIdx+3:]
-				if vEnd := strings.Index(vRest, `"`); vEnd >= 0 {
-					brands = append(brands, brandEntry{brand, vRest[:vEnd]})
-				}
-			}
-		}
-		// Prioritise specific browsers over the generic "Google Chrome" entry.
-		priority := func(name string) int {
-			switch name {
-			case "Brave":
-				return 4
-			case "Opera", "OPR":
-				return 3
-			case "Microsoft Edge":
-				return 2
-			case "Google Chrome":
-				return 1
-			default:
-				return 0
-			}
-		}
-		best := -1
-		for i, b := range brands {
-			if best < 0 || priority(b.name) > priority(brands[best].name) {
-				best = i
-			}
-		}
-		if best >= 0 {
-			browserName = brands[best].name
-			browserVersion = brands[best].version
-		}
-	}
-
-	// ── Browser: fallback to classic UA-string detection ────────────────────
+	browserName, browserVersion = parseBrandHeader(secCHUA)
 	if browserName == "" {
-		switch {
-		case strings.Contains(userAgent, "Firefox/"):
-			browserName = "Firefox"
-			browserVersion = uaMajorVersion(userAgent, "Firefox/")
-		case strings.Contains(userAgent, "Edg/"):
-			browserName = "Edge"
-			browserVersion = uaMajorVersion(userAgent, "Edg/")
-		case strings.Contains(userAgent, "OPR/"):
-			browserName = "Opera"
-			browserVersion = uaMajorVersion(userAgent, "OPR/")
-		case strings.Contains(userAgent, "Chrome/"):
-			browserName = "Chrome"
-			browserVersion = uaMajorVersion(userAgent, "Chrome/")
-		case strings.Contains(userAgent, "Version/") && strings.Contains(userAgent, "Safari/"):
-			browserName = "Safari"
-			browserVersion = uaMajorVersion(userAgent, "Version/")
+		browserName, browserVersion = detectBrowserFromUA(userAgent)
+	}
+	clientOSName = detectOSFromUA(userAgent)
+	return
+}
+
+// parseBrandHeader parses the Sec-CH-UA header and returns the most specific
+// browser name and major version. Priority: Brave > Opera > Edge > Chrome.
+func parseBrandHeader(secCHUA string) (name, version string) {
+	if secCHUA == "" {
+		return
+	}
+	type brandEntry struct{ name, version string }
+	var brands []brandEntry
+	for _, part := range strings.Split(secCHUA, ",") {
+		part = strings.TrimSpace(part)
+		bStart := strings.Index(part, `"`)
+		if bStart < 0 {
+			continue
+		}
+		bEnd := strings.Index(part[bStart+1:], `"`)
+		if bEnd < 0 {
+			continue
+		}
+		brand := part[bStart+1 : bStart+1+bEnd]
+		if strings.Contains(brand, "Not") || brand == "Chromium" {
+			continue
+		}
+		vIdx := strings.Index(part, `v="`)
+		if vIdx < 0 {
+			continue
+		}
+		vRest := part[vIdx+3:]
+		if vEnd := strings.Index(vRest, `"`); vEnd >= 0 {
+			brands = append(brands, brandEntry{brand, vRest[:vEnd]})
 		}
 	}
-
-	// ── Client OS: derived from the platform section of the UA string ───────
-	switch {
-	case strings.Contains(userAgent, "iPhone") || strings.Contains(userAgent, "iPad"):
-		clientOSName = "iOS"
-	case strings.Contains(userAgent, "Android"):
-		clientOSName = "Android"
-	case strings.Contains(userAgent, "Macintosh") || strings.Contains(userAgent, "Mac OS X"):
-		clientOSName = "macOS"
-	case strings.Contains(userAgent, "Windows NT"):
-		clientOSName = "Windows"
-	case strings.Contains(userAgent, "CrOS"):
-		clientOSName = "Chrome OS"
-	case strings.Contains(userAgent, "Linux"):
-		clientOSName = "Linux"
+	best := -1
+	for i, b := range brands {
+		if best < 0 || brandPriority(b.name) > brandPriority(brands[best].name) {
+			best = i
+		}
+	}
+	if best >= 0 {
+		name = brands[best].name
+		version = brands[best].version
 	}
 	return
+}
+
+// brandPriority returns the detection priority for a Sec-CH-UA brand name.
+// Higher value wins over lower when multiple brands are present.
+func brandPriority(name string) int {
+	switch name {
+	case "Brave":
+		return 4
+	case "Opera", "OPR":
+		return 3
+	case "Microsoft Edge":
+		return 2
+	case "Google Chrome":
+		return 1
+	default:
+		return 0
+	}
+}
+
+// detectBrowserFromUA returns the browser name and major version from the
+// classic User-Agent string when Sec-CH-UA is unavailable.
+func detectBrowserFromUA(userAgent string) (name, version string) {
+	switch {
+	case strings.Contains(userAgent, "Firefox/"):
+		return "Firefox", uaMajorVersion(userAgent, "Firefox/")
+	case strings.Contains(userAgent, "Edg/"):
+		return "Edge", uaMajorVersion(userAgent, "Edg/")
+	case strings.Contains(userAgent, "OPR/"):
+		return "Opera", uaMajorVersion(userAgent, "OPR/")
+	case strings.Contains(userAgent, "Chrome/"):
+		return "Chrome", uaMajorVersion(userAgent, "Chrome/")
+	case strings.Contains(userAgent, "Version/") && strings.Contains(userAgent, "Safari/"):
+		return "Safari", uaMajorVersion(userAgent, "Version/")
+	}
+	return
+}
+
+// detectOSFromUA returns the client OS name derived from the User-Agent string.
+func detectOSFromUA(userAgent string) string {
+	switch {
+	case strings.Contains(userAgent, "iPhone") || strings.Contains(userAgent, "iPad"):
+		return "iOS"
+	case strings.Contains(userAgent, "Android"):
+		return "Android"
+	case strings.Contains(userAgent, "Macintosh") || strings.Contains(userAgent, "Mac OS X"):
+		return "macOS"
+	case strings.Contains(userAgent, "Windows NT"):
+		return "Windows"
+	case strings.Contains(userAgent, "CrOS"):
+		return "Chrome OS"
+	case strings.Contains(userAgent, "Linux"):
+		return "Linux"
+	}
+	return ""
 }
 
 // uaMajorVersion extracts the major version number after prefix in the UA string.
