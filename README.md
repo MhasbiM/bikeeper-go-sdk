@@ -11,9 +11,10 @@ Official Go SDK for [Bikeeper](https://github.com/MhasbiM/bikeeper) — a self-h
 
 | Package | Import path | Description |
 |---|---|---|
-| Core | `github.com/MhasbiM/bikeeper-go-sdk` | Client, Hub, Span, tracing |
+| Core | `github.com/MhasbiM/bikeeper-go-sdk` | Client, Hub, Logger, Span, tracing |
 | Fiber | `github.com/MhasbiM/bikeeper-go-sdk/fiber` | Middleware for [Fiber v3](https://github.com/gofiber/fiber) |
 | Echo | `github.com/MhasbiM/bikeeper-go-sdk/echo` | Middleware for [Echo v4](https://github.com/labstack/echo) |
+| Zap | `github.com/MhasbiM/bikeeper-go-sdk/zap` | [go.uber.org/zap](https://github.com/uber-go/zap) core integration |
 
 ## Requirements
 
@@ -33,6 +34,9 @@ go get github.com/MhasbiM/bikeeper-go-sdk/fiber@v1.0.0
 
 # Echo
 go get github.com/MhasbiM/bikeeper-go-sdk/echo@v1.0.0
+
+# Zap integration
+go get github.com/MhasbiM/bikeeper-go-sdk/zap@v1.0.0
 ```
 
 ## Quick Start
@@ -122,6 +126,79 @@ e.GET("/", func(c echo.Context) error {
     }
     return c.String(200, "ok")
 })
+```
+
+### Logger (structured logging)
+
+Send structured log entries as Bikeeper events using the built-in `Logger` API.
+Each log-level method returns a chainable `LogEntry` builder.
+
+```go
+import bikeeper "github.com/MhasbiM/bikeeper-go-sdk"
+
+logger := client.NewLogger(ctx)
+
+// Simple emit — args formatted with fmt.Sprint
+logger.Info().Emit("server started")
+
+// Formatted emit — fmt.Printf style
+logger.Error().Emitf("payment failed: %v", err)
+
+// Per-entry tag (does not modify the logger)
+logger.Warn().
+    WithTag("gateway", "stripe").
+    WithTag("attempt", "3").
+    Emit("gateway slow response")
+
+// Logger-level tags — inherited by every entry from the derived logger
+serviceLogger := logger.
+    WithTag("service", "checkout").
+    WithTag("env", "production")
+serviceLogger.Debug().Emit("cart validated")
+serviceLogger.Error().Emitf("stock check failed: %v", err)
+```
+
+### Zap integration
+
+Forward [go.uber.org/zap](https://github.com/uber-go/zap) log entries to Bikeeper automatically.
+Structured `zap.Field` values become Bikeeper tags — no changes required at call sites.
+
+```go
+import (
+    bikeeper        "github.com/MhasbiM/bikeeper-go-sdk"
+    bikeeperzap     "github.com/MhasbiM/bikeeper-go-sdk/zap"
+    "go.uber.org/zap"
+    "go.uber.org/zap/zapcore"
+)
+
+// Tee an existing logger: warn+ entries go to Bikeeper, all entries go to stdout.
+zapLogger, _ := zap.NewProduction()
+zapLogger = bikeeperzap.AttachTo(zapLogger, client, ctx, zapcore.WarnLevel)
+
+// These two lines go to stdout only (below WarnLevel).
+zapLogger.Debug("order lookup started", zap.String("order_id", "ORD-001"))
+zapLogger.Info("order found", zap.String("order_id", "ORD-001"))
+
+// These go to stdout AND to Bikeeper as captured events.
+// zap.Field values are mapped to Bikeeper tags automatically.
+zapLogger.Warn("payment retry #2",
+    zap.String("gateway", "stripe"),
+    zap.Int("attempt", 2),
+)
+zapLogger.Error("stripe gateway timeout",
+    zap.String("order_id", "ORD-001"),
+    zap.Error(fmt.Errorf("context deadline exceeded")),
+)
+```
+
+Build from scratch using `zapcore.NewTee`:
+
+```go
+core := zapcore.NewTee(
+    zapcore.NewCore(enc, sink, lvl),                          // stdout / file
+    bikeeperzap.NewCore(client, ctx, zapcore.WarnLevel),      // Bikeeper
+)
+logger := zap.New(core, zap.AddCaller())
 ```
 
 ## Configuration
