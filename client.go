@@ -79,6 +79,32 @@ func New(opts Options) *Client {
 	return c
 }
 
+// NewWithTransport creates a Client using the provided [Transport] instead of
+// the default HTTP transport. Intended for testing — callers can pass a fake
+// transport to capture events in-process without a running server.
+//
+// The same credential validation as [New] applies.
+func NewWithTransport(t Transport, opts Options) *Client {
+	if opts.ClientID == "" {
+		panic("bikeeper: ClientID must not be empty")
+	}
+	if opts.ClientSecret == "" {
+		panic("bikeeper: ClientSecret must not be empty")
+	}
+	if opts.ProjectID == "" {
+		panic("bikeeper: ProjectID must not be empty — copy it from the Bikeeper dashboard")
+	}
+	if opts.Timeout == 0 {
+		opts.Timeout = 5 * time.Second
+	}
+	if opts.FlushTimeout == 0 {
+		opts.FlushTimeout = 2 * time.Second
+	}
+	c := &Client{opts: opts, packages: collectPackages(), serverIPs: collectServerIPs()}
+	c.transport = t
+	return c
+}
+
 // collectServerIPs returns all non-loopback IPv4 and IPv6 addresses assigned
 // to the host's network interfaces. Called once at startup and cached.
 func collectServerIPs() []string {
