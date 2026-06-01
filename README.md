@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Version](https://img.shields.io/badge/version-v1.0.0-blue)
 
-Official Go SDK for [Bikeeper](https://github.com/bikeeper) — a self-hosted error monitoring and performance tracking platform.
+Official Go SDK for [Bikeeper](https://github.com/MhasbiM/bikeeper) — a self-hosted error monitoring and performance tracking platform.
 
 ## Packages
 
