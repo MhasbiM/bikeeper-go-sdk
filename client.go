@@ -14,6 +14,7 @@ package bikeeper
 
 import (
 	"context"
+	"net"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -44,6 +45,7 @@ type Client struct {
 	transport Transport
 	wg        sync.WaitGroup // tracks in-flight captureAsync goroutines
 	packages  []Package      // cached from runtime/debug.ReadBuildInfo at New() time
+	serverIPs []string       // non-loopback IPs collected once at startup
 
 	mu         sync.RWMutex // protects globalTags
 	globalTags []Tag        // set via SetTag; prepended to every event
@@ -72,9 +74,33 @@ func New(opts Options) *Client {
 		opts.FlushTimeout = 2 * time.Second
 	}
 
-	c := &Client{opts: opts, packages: collectPackages()}
+	c := &Client{opts: opts, packages: collectPackages(), serverIPs: collectServerIPs()}
 	c.transport = newHTTPTransport(&c.opts)
 	return c
+}
+
+// collectServerIPs returns all non-loopback IPv4 and IPv6 addresses assigned
+// to the host's network interfaces. Called once at startup and cached.
+func collectServerIPs() []string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil
+	}
+	var ips []string
+	for _, addr := range addrs {
+		var ip net.IP
+		switch v := addr.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+			continue
+		}
+		ips = append(ips, ip.String())
+	}
+	return ips
 }
 
 // collectPackages reads the Go module dependency list that was embedded into the
@@ -260,7 +286,7 @@ func (c *Client) SetFramework(f string) {
 // enrichEvent prepends Environment and Release from Options as tags, and
 // auto-populates SDK info, server runtime, OS, and device arch so every event
 // carries full context without requiring the caller to set them manually.
-func (c *Client) enrichEvent(event *Event) *Event {
+func (c *Client) enrichEvent(event *Event) *Event { //nolint:cyclop
 	c.mu.RLock()
 	global := make([]Tag, len(c.globalTags))
 	copy(global, c.globalTags)
@@ -286,7 +312,7 @@ func (c *Client) enrichEvent(event *Event) *Event {
 	}
 
 	enrichContexts(event)
-	appendServerMetaTags(event)
+	c.appendServerMetaTags(event)
 
 	return event
 }
@@ -304,14 +330,22 @@ func enrichContexts(event *Event) {
 		event.Contexts.OS = &OSInfo{Name: runtime.GOOS}
 	}
 	if event.Contexts.Device == nil {
-		event.Contexts.Device = &DeviceInfo{Arch: runtime.GOARCH}
+		hostname, _ := os.Hostname()
+		event.Contexts.Device = &DeviceInfo{
+			Name: hostname,
+			Arch: runtime.GOARCH,
+		}
 	}
 }
 
-// appendServerMetaTags appends runtime and host metadata tags to event,
+// appendServerMetaTags appends runtime, host, and memory metadata tags to event,
 // skipping any keys already present.
-func appendServerMetaTags(event *Event) {
+func (c *Client) appendServerMetaTags(event *Event) {
 	rtVer := event.Contexts.Runtime.Version
+
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+
 	serverMeta := []Tag{
 		{Key: "num_cpu", Value: strconv.Itoa(runtime.NumCPU())},
 		{Key: "go_maxprocs", Value: strconv.Itoa(runtime.GOMAXPROCS(0))},
@@ -320,13 +354,29 @@ func appendServerMetaTags(event *Event) {
 		{Key: "os.name", Value: runtime.GOOS},
 		{Key: "runtime", Value: "go " + rtVer},
 		{Key: "runtime.name", Value: "go"},
+		// Memory stats
+		{Key: "mem_alloc_kb", Value: strconv.FormatUint(ms.Alloc/1024, 10)},
+		{Key: "mem_sys_kb", Value: strconv.FormatUint(ms.Sys/1024, 10)},
+		{Key: "mem_heap_inuse_kb", Value: strconv.FormatUint(ms.HeapInuse/1024, 10)},
+		{Key: "mem_heap_objects", Value: strconv.FormatUint(ms.HeapObjects, 10)},
 	}
+
 	var gcStats debug.GCStats
 	debug.ReadGCStats(&gcStats)
 	serverMeta = append(serverMeta, Tag{Key: "go_numgcalls", Value: strconv.FormatInt(gcStats.NumGC, 10)})
+
 	if hostname, err := os.Hostname(); err == nil && hostname != "" {
 		serverMeta = append(serverMeta, Tag{Key: "server_name", Value: hostname})
 	}
+
+	// Server IP addresses — cached at startup, joined as comma-separated string.
+	if len(c.serverIPs) > 0 {
+		serverMeta = append(serverMeta,
+			Tag{Key: "server_ip", Value: c.serverIPs[0]},
+			Tag{Key: "server_ips", Value: strings.Join(c.serverIPs, ",")},
+		)
+	}
+
 	existing := make(map[string]struct{}, len(event.Tags))
 	for _, t := range event.Tags {
 		existing[t.Key] = struct{}{}
