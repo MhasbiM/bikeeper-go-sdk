@@ -87,17 +87,11 @@ func (h *Hub) CaptureException(err error, tags ...Tag) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// Snapshot the scope once to get a consistent view even if WithScope is
-	// running concurrently on another goroutine.
 	scope := h.scopeSnapshot()
 
 	ev := NewEvent(LevelError, err.Error())
-	ex := buildExceptionValue(err, 1) // skip: CaptureException itself; direct caller is the first captured frame
+	ex := buildExceptionValue(err, 1)
 	ev.Exception = ex
-	// For named custom error types, use the type name as the event message so
-	// the issues list title is concise (e.g. "*main.AppError" instead of the
-	// verbose err.Error() string). Generic runtime wrappers are excluded because
-	// their type name carries no additional information over the message.
 	if ex.Type != "" &&
 		ex.Type != "*errors.errorString" &&
 		ex.Type != "*fmt.wrapError" &&
@@ -105,80 +99,18 @@ func (h *Hub) CaptureException(err error, tags ...Tag) {
 		ev.Message = ex.Type
 	}
 	if ex.Stacktrace != nil {
-		// fingerprint[0] = all-frames hash, fingerprint[1] = in-app-only hash
 		ev.Fingerprint = []string{
 			computeAllFramesGroupingHash(ex.Type, ex.Stacktrace.Frames),
 			computeGroupingHash(ex.Type, ex.Stacktrace.Frames),
 		}
 	}
-	// A custom scope fingerprint overrides the auto-computed hash so that all
-	// events sharing the same logical error group collapse into one Bikeeper issue.
 	if fp := scope.fingerprint(); fp != nil {
 		ev.Fingerprint = fp
 	}
 
-	// Attach trace context from the active span.
-	if span := SpanFromContext(ctx); span != nil {
-		ev.TraceID = span.TraceID
-		if ev.Contexts == nil {
-			ev.Contexts = &Contexts{}
-		}
-		ev.Contexts.Trace = span.TraceInfo()
-		for k, v := range span.Tags {
-			ev.Tags = append(ev.Tags, Tag{Key: k, Value: v})
-		}
-	}
-
-	// Apply HTTP context from the scope (set by the framework middleware).
-	if scopeURL, scopeReq, bName, bVersion, osName := scope.httpContext(); scopeURL != "" {
-		if ev.URL == "" {
-			ev.URL = scopeURL
-		}
-		if ev.HTTPRequest == nil {
-			ev.HTTPRequest = scopeReq
-		}
-		// Enrich browser / OS contexts if not already set.
-		if bName != "" {
-			if ev.Contexts == nil {
-				ev.Contexts = &Contexts{}
-			}
-			if ev.Contexts.Browser == nil {
-				ev.Contexts.Browser = &BrowserInfo{Name: bName, Version: bVersion}
-			}
-			display := bName
-			if bVersion != "" {
-				display = bName + " " + bVersion
-			}
-			ev.Tags = append(ev.Tags,
-				Tag{Key: "browser", Value: display},
-				Tag{Key: "browser.name", Value: bName},
-			)
-			if bVersion != "" {
-				ev.Tags = append(ev.Tags, Tag{Key: "browser.version", Value: bVersion})
-			}
-		}
-		if osName != "" {
-			if ev.Contexts == nil {
-				ev.Contexts = &Contexts{}
-			}
-			if ev.Contexts.ClientOS == nil {
-				ev.Contexts.ClientOS = &OSInfo{Name: osName}
-			}
-			ev.Tags = append(ev.Tags,
-				Tag{Key: "client_os", Value: osName},
-				Tag{Key: "client_os.name", Value: osName},
-			)
-		}
-	}
-
-	// Merge scope tags then per-call tags (scope < call tags in precedence).
-	ev.Tags = append(scope.Tags(), ev.Tags...)
-	ev.Tags = append(ev.Tags, tags...)
-
-	// Attach breadcrumbs and user identity from the scope.
-	ev.Breadcrumbs = scope.breadcrumbSnapshot()
-	ev.User = scope.getUser()
-	ev.Extra = scope.extrasSnapshot()
+	attachSpanContext(ctx, ev)
+	applyHTTPContext(ev, scope)
+	applyScopeData(ev, scope, tags)
 
 	h.client.CaptureEventAsync(ev)
 }
@@ -193,13 +125,10 @@ func (h *Hub) CaptureMessage(message string, level Level, tags ...Tag) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// Snapshot the scope once to avoid races with concurrent WithScope calls.
 	scope := h.scopeSnapshot()
 
 	ev := NewEvent(level, message)
 
-	// Capture a stacktrace so message events show call-site context in the dashboard.
-	// skip=1: CaptureMessage itself is omitted; user code is the first visible frame.
 	st := captureStacktrace(1)
 	exType := callerFunctionName(st)
 	ev.Exception = &ExceptionValue{
@@ -209,8 +138,6 @@ func (h *Hub) CaptureMessage(message string, level Level, tags ...Tag) {
 		Stacktrace: st,
 	}
 
-	// A custom scope fingerprint forces all messages through this scope into
-	// a single issue group in Bikeeper; otherwise derive from the call stack.
 	if fp := scope.fingerprint(); fp != nil {
 		ev.Fingerprint = fp
 	} else if st != nil {
@@ -220,67 +147,94 @@ func (h *Hub) CaptureMessage(message string, level Level, tags ...Tag) {
 		}
 	}
 
-	if span := SpanFromContext(ctx); span != nil {
-		ev.TraceID = span.TraceID
-		if ev.Contexts == nil {
-			ev.Contexts = &Contexts{}
-		}
-		ev.Contexts.Trace = span.TraceInfo()
-		for k, v := range span.Tags {
-			ev.Tags = append(ev.Tags, Tag{Key: k, Value: v})
-		}
-	}
+	attachSpanContext(ctx, ev)
+	applyHTTPContext(ev, scope)
+	applyScopeData(ev, scope, tags)
 
-	// Apply HTTP context from the scope.
-	if scopeURL, scopeReq, bName, bVersion, osName := scope.httpContext(); scopeURL != "" {
-		if ev.URL == "" {
-			ev.URL = scopeURL
-		}
-		if ev.HTTPRequest == nil {
-			ev.HTTPRequest = scopeReq
-		}
-		if bName != "" {
-			if ev.Contexts == nil {
-				ev.Contexts = &Contexts{}
-			}
-			if ev.Contexts.Browser == nil {
-				ev.Contexts.Browser = &BrowserInfo{Name: bName, Version: bVersion}
-			}
-			display := bName
-			if bVersion != "" {
-				display = bName + " " + bVersion
-			}
-			ev.Tags = append(ev.Tags,
-				Tag{Key: "browser", Value: display},
-				Tag{Key: "browser.name", Value: bName},
-			)
-			if bVersion != "" {
-				ev.Tags = append(ev.Tags, Tag{Key: "browser.version", Value: bVersion})
-			}
-		}
-		if osName != "" {
-			if ev.Contexts == nil {
-				ev.Contexts = &Contexts{}
-			}
-			if ev.Contexts.ClientOS == nil {
-				ev.Contexts.ClientOS = &OSInfo{Name: osName}
-			}
-			ev.Tags = append(ev.Tags,
-				Tag{Key: "client_os", Value: osName},
-				Tag{Key: "client_os.name", Value: osName},
-			)
-		}
-	}
+	h.client.CaptureEventAsync(ev)
+}
 
+// attachSpanContext enriches ev with trace information from the active span in ctx.
+func attachSpanContext(ctx context.Context, ev *Event) {
+	span := SpanFromContext(ctx)
+	if span == nil {
+		return
+	}
+	ev.TraceID = span.TraceID
+	if ev.Contexts == nil {
+		ev.Contexts = &Contexts{}
+	}
+	ev.Contexts.Trace = span.TraceInfo()
+	for k, v := range span.Tags {
+		ev.Tags = append(ev.Tags, Tag{Key: k, Value: v})
+	}
+}
+
+// applyHTTPContext enriches ev with HTTP request context from scope
+// (URL, request, browser info, and client OS tags).
+func applyHTTPContext(ev *Event, scope *Scope) {
+	scopeURL, scopeReq, bName, bVersion, osName := scope.httpContext()
+	if scopeURL == "" {
+		return
+	}
+	if ev.URL == "" {
+		ev.URL = scopeURL
+	}
+	if ev.HTTPRequest == nil {
+		ev.HTTPRequest = scopeReq
+	}
+	applyBrowserContext(ev, bName, bVersion)
+	applyClientOSContext(ev, osName)
+}
+
+// applyBrowserContext adds browser info and tags to ev when bName is non-empty.
+func applyBrowserContext(ev *Event, bName, bVersion string) {
+	if bName == "" {
+		return
+	}
+	if ev.Contexts == nil {
+		ev.Contexts = &Contexts{}
+	}
+	if ev.Contexts.Browser == nil {
+		ev.Contexts.Browser = &BrowserInfo{Name: bName, Version: bVersion}
+	}
+	display := bName
+	if bVersion != "" {
+		display = bName + " " + bVersion
+	}
+	ev.Tags = append(ev.Tags,
+		Tag{Key: "browser", Value: display},
+		Tag{Key: "browser.name", Value: bName},
+	)
+	if bVersion != "" {
+		ev.Tags = append(ev.Tags, Tag{Key: "browser.version", Value: bVersion})
+	}
+}
+
+// applyClientOSContext adds client OS info and tags to ev when osName is non-empty.
+func applyClientOSContext(ev *Event, osName string) {
+	if osName == "" {
+		return
+	}
+	if ev.Contexts == nil {
+		ev.Contexts = &Contexts{}
+	}
+	if ev.Contexts.ClientOS == nil {
+		ev.Contexts.ClientOS = &OSInfo{Name: osName}
+	}
+	ev.Tags = append(ev.Tags,
+		Tag{Key: "client_os", Value: osName},
+		Tag{Key: "client_os.name", Value: osName},
+	)
+}
+
+// applyScopeData merges scope tags, per-call tags, breadcrumbs, user, and extras into ev.
+func applyScopeData(ev *Event, scope *Scope, tags []Tag) {
 	ev.Tags = append(scope.Tags(), ev.Tags...)
 	ev.Tags = append(ev.Tags, tags...)
-
-	// Attach breadcrumbs and user identity from the scope.
 	ev.Breadcrumbs = scope.breadcrumbSnapshot()
 	ev.User = scope.getUser()
 	ev.Extra = scope.extrasSnapshot()
-
-	h.client.CaptureEventAsync(ev)
 }
 
 // Scope returns the hub's mutable Scope.

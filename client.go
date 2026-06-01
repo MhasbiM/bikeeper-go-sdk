@@ -261,13 +261,11 @@ func (c *Client) SetFramework(f string) {
 // auto-populates SDK info, server runtime, OS, and device arch so every event
 // carries full context without requiring the caller to set them manually.
 func (c *Client) enrichEvent(event *Event) *Event {
-	// Global tags set via SetTag — prepended first so they appear before all others.
 	c.mu.RLock()
 	global := make([]Tag, len(c.globalTags))
 	copy(global, c.globalTags)
 	c.mu.RUnlock()
 
-	// Environment and Release tags — prepend so they appear first.
 	var extra []Tag
 	if c.opts.Environment != "" {
 		extra = append(extra, Tag{Key: "environment", Value: c.opts.Environment})
@@ -280,42 +278,39 @@ func (c *Client) enrichEvent(event *Event) *Event {
 		event.Tags = append(extra, event.Tags...)
 	}
 
-	// SDK identification.
 	if event.SDK == nil {
 		event.SDK = &SDKInfo{Name: sdkName, Version: sdkVersion}
 	}
-
-	// Packages — attached once from the cached build-info list.
 	if len(event.Packages) == 0 && len(c.packages) > 0 {
 		event.Packages = c.packages
 	}
 
-	// Server-side context — only fill in what the caller has not already set.
+	enrichContexts(event)
+	appendServerMetaTags(event)
+
+	return event
+}
+
+// enrichContexts fills nil Contexts fields with server-side runtime information.
+func enrichContexts(event *Event) {
 	if event.Contexts == nil {
 		event.Contexts = &Contexts{}
 	}
 	if event.Contexts.Runtime == nil {
-		ver := runtime.Version()
-		ver = strings.TrimPrefix(ver, "go") // "go1.22.3" → "1.22.3"
-		event.Contexts.Runtime = &RuntimeInfo{
-			Name:    "go",
-			Version: ver,
-		}
+		ver := strings.TrimPrefix(runtime.Version(), "go")
+		event.Contexts.Runtime = &RuntimeInfo{Name: "go", Version: ver}
 	}
 	if event.Contexts.OS == nil {
-		event.Contexts.OS = &OSInfo{
-			Name: runtime.GOOS,
-		}
+		event.Contexts.OS = &OSInfo{Name: runtime.GOOS}
 	}
 	if event.Contexts.Device == nil {
-		event.Contexts.Device = &DeviceInfo{
-			Arch: runtime.GOARCH,
-		}
+		event.Contexts.Device = &DeviceInfo{Arch: runtime.GOARCH}
 	}
+}
 
-	// Append server-side metadata tags derived from the runtime.
-	// These are appended last so that per-event tags always take precedence.
-	// Keys already present in the event are skipped to avoid duplicates.
+// appendServerMetaTags appends runtime and host metadata tags to event,
+// skipping any keys already present.
+func appendServerMetaTags(event *Event) {
 	rtVer := event.Contexts.Runtime.Version
 	serverMeta := []Tag{
 		{Key: "num_cpu", Value: strconv.Itoa(runtime.NumCPU())},
@@ -341,6 +336,4 @@ func (c *Client) enrichEvent(event *Event) *Event {
 			event.Tags = append(event.Tags, t)
 		}
 	}
-
-	return event
 }
