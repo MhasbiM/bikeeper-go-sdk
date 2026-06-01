@@ -36,7 +36,7 @@ const (
 
 // sdkName and sdkVersion identify this SDK in the sdk field of every event.
 const sdkName = "bikeeper-go"
-const sdkVersion = "0.1.0"
+const sdkVersion = "1.0.0"
 
 // Client is the Bikeeper SDK client.
 type Client struct {
