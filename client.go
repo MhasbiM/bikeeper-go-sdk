@@ -22,6 +22,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // Level represents the severity of an event.
@@ -163,13 +165,63 @@ func collectPackages() []Package {
 	return pkgs
 }
 
+// newLogRecord builds a [LogRecord] enriched with Options metadata.
+// Global tags, Environment, Release, and ServerName are merged in.
+func (c *Client) newLogRecord(level Level, message string, tags []Tag) *LogRecord {
+	c.mu.RLock()
+	global := make([]Tag, len(c.globalTags))
+	copy(global, c.globalTags)
+	c.mu.RUnlock()
+
+	all := append(global, tags...)
+
+	var serverName string
+	if h, err := os.Hostname(); err == nil {
+		serverName = h
+	}
+
+	return &LogRecord{
+		ID:          uuid.New().String(),
+		Level:       string(level),
+		Message:     message,
+		Tags:        all,
+		Timestamp:   time.Now().UTC(),
+		SDK:         &SDKInfo{Name: sdkName, Version: sdkVersion},
+		Environment: c.opts.Environment,
+		Release:     c.opts.Release,
+		ServerName:  serverName,
+	}
+}
+
+// captureLogAsync sends a [LogRecord] to the /api/v1/logs endpoint
+// asynchronously via a background goroutine tracked by wg.
+//
+// If the underlying transport does not implement [logSender] (e.g. a test fake
+// that only captures events), the record is dropped silently — no error is
+// reported and no goroutine is launched.
+func (c *Client) captureLogAsync(record *LogRecord) {
+	ls, ok := c.transport.(logSender)
+	if !ok {
+		return
+	}
+	c.wg.Go(func() {
+		sendCtx, cancel := context.WithTimeout(context.Background(), c.opts.Timeout)
+		defer cancel()
+		if err := ls.SendLog(sendCtx, record); err != nil {
+			if c.opts.OnError != nil {
+				c.opts.OnError(err)
+			}
+		}
+	})
+}
+
 // CaptureException captures an error event and sends it to Bikeeper asynchronously.
 // A full Go stack trace is captured automatically at the call site and attached
 // to the event as structured exception data (type, message, frames with source
 // context). The grouping fingerprint is computed from the error type + in-app
 // frames so that the same root cause is grouped as one issue in the dashboard.
 func (c *Client) CaptureException(ctx context.Context, err error, tags ...Tag) {
-	if err == nil {
+	if c == nil || err == nil {
 		return
 	}
 	event := NewEvent(LevelError, err.Error(), tags...)
@@ -190,6 +242,9 @@ func (c *Client) CaptureException(ctx context.Context, err error, tags ...Tag) {
 // A stacktrace is captured at the call site and attached as exception data so
 // the call-site frame appears in the Bikeeper dashboard alongside the message.
 func (c *Client) CaptureMessage(ctx context.Context, message string, level Level, tags ...Tag) {
+	if c == nil {
+		return
+	}
 	event := NewEvent(level, message, tags...)
 	// skip=1: CaptureMessage itself is omitted; user code is the first visible frame.
 	st := captureStacktrace(1)
@@ -212,6 +267,9 @@ func (c *Client) CaptureMessage(ctx context.Context, message string, level Level
 
 // Capture sends an event synchronously and returns any transport error.
 func (c *Client) Capture(ctx context.Context, event *Event) error {
+	if c == nil || event == nil {
+		return nil
+	}
 	return c.transport.Send(ctx, c.enrichEvent(event))
 }
 
@@ -222,11 +280,17 @@ func (c *Client) Capture(ctx context.Context, event *Event) error {
 // This is the method framework middlewares use when they build a full event
 // with HTTP request context before sending.
 func (c *Client) CaptureEventAsync(event *Event) {
+	if c == nil || event == nil {
+		return
+	}
 	c.captureAsync(c.enrichEvent(event))
 }
 
 // Flush blocks until all in-flight async events are delivered or FlushTimeout expires.
 func (c *Client) Flush() {
+	if c == nil {
+		return
+	}
 	done := make(chan struct{})
 	go func() {
 		c.wg.Wait()
@@ -243,6 +307,9 @@ func (c *Client) Flush() {
 
 // Close flushes remaining events and releases resources.
 func (c *Client) Close() {
+	if c == nil {
+		return
+	}
 	c.Flush()
 }
 
@@ -265,6 +332,9 @@ func (c *Client) captureAsync(event *Event) {
 // by this client. If a tag with the same key already exists it is overwritten.
 // Tags set here are merged before per-event tags, so per-event tags take precedence.
 func (c *Client) SetTag(key, value string) {
+	if c == nil {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for i, t := range c.globalTags {
@@ -278,6 +348,9 @@ func (c *Client) SetTag(key, value string) {
 
 // RemoveTag removes a global tag by key. No-op if the key does not exist.
 func (c *Client) RemoveTag(key string) {
+	if c == nil {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for i, t := range c.globalTags {
@@ -290,6 +363,9 @@ func (c *Client) RemoveTag(key string) {
 
 // Tags returns a snapshot of the current global tags.
 func (c *Client) Tags() []Tag {
+	if c == nil {
+		return nil
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	snap := make([]Tag, len(c.globalTags))
@@ -299,6 +375,9 @@ func (c *Client) Tags() []Tag {
 
 // Framework returns the framework identifier configured for this client (e.g. "fiber", "echo").
 func (c *Client) Framework() string {
+	if c == nil {
+		return ""
+	}
 	return c.opts.Framework
 }
 
@@ -306,6 +385,9 @@ func (c *Client) Framework() string {
 // This is called automatically by framework middleware packages (bikeeperfiber,
 // bikeeperecho) at startup — there is no need to set Options.Framework manually.
 func (c *Client) SetFramework(f string) {
+	if c == nil {
+		return
+	}
 	c.opts.Framework = f
 }
 

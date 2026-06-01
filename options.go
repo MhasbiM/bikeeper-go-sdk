@@ -43,4 +43,17 @@ type Options struct {
 	// OnError is called when an async event send fails (e.g. network error,
 	// auth failure, server rejection). If nil, failures are silently discarded.
 	OnError func(err error)
+
+	// EnableLogging separates Logger entries from events.
+	//
+	// When false (default), [Logger] / [LogEntry].Emit calls fall through to
+	// [Client.CaptureMessage], so log entries appear in the Events view exactly
+	// as before.
+	//
+	// When true, [Logger] / [LogEntry].Emit sends a lightweight [LogRecord] to
+	// the dedicated POST /api/v1/logs endpoint and the entry is stored in the
+	// logs table — separate from the events table. This mirrors Sentry's
+	// structured-logging feature where logs are a first-class resource alongside
+	// errors.
+	EnableLogging bool
 }

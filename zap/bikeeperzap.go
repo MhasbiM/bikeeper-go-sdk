@@ -98,6 +98,9 @@ func (c *Core) Check(entry zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.Che
 // event. Structured zap fields are encoded into Bikeeper [bikeeper.Tag] values
 // so they appear in the dashboard's tag panel.
 func (c *Core) Write(entry zapcore.Entry, fields []zap.Field) error {
+	if c.client == nil {
+		return nil
+	}
 	level := zapLevelToBikeeper(entry.Level)
 	allFields := append(c.fields, fields...) //nolint:gocritic // intentional append-to-slice
 	tags := fieldsToTags(allFields)

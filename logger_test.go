@@ -423,3 +423,221 @@ func ExampleClient_NewLogger() {
 	logger.Error().WithTag("order_id", "ORD-001").Emitf("payment failed: %v", fmt.Errorf("timeout"))
 	// Output:
 }
+
+// ─── EnableLogging tests ──────────────────────────────────────────────────────
+
+// logCaptureTransport records both events (via Send) and log records (via SendLog).
+// It satisfies the Transport interface and the internal logSender interface so
+// that captureLogAsync can dispatch to SendLog when EnableLogging is true.
+type logCaptureTransport struct {
+	mu     sync.Mutex
+	events []*Event
+	logs   []*LogRecord
+}
+
+func (t *logCaptureTransport) Send(_ context.Context, event *Event) error {
+	ev := *event
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.events = append(t.events, &ev)
+	return nil
+}
+
+func (t *logCaptureTransport) Flush(_ context.Context) {}
+
+func (t *logCaptureTransport) SendLog(_ context.Context, rec *LogRecord) error {
+	r := *rec
+	if len(rec.Tags) > 0 {
+		r.Tags = make([]Tag, len(rec.Tags))
+		copy(r.Tags, rec.Tags)
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.logs = append(t.logs, &r)
+	return nil
+}
+
+func (t *logCaptureTransport) capturedLogs() []*LogRecord {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]*LogRecord, len(t.logs))
+	copy(out, t.logs)
+	return out
+}
+
+func (t *logCaptureTransport) capturedEvents() []*Event {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]*Event, len(t.events))
+	copy(out, t.events)
+	return out
+}
+
+// newLogTestClient returns a Client with EnableLogging: true and a logCaptureTransport.
+func newLogTestClient() (*Client, *logCaptureTransport) {
+	tr := &logCaptureTransport{}
+	c := &Client{
+		opts: Options{
+			ClientID:      "test-client-id",
+			ClientSecret:  "test-client-secret",
+			ProjectID:     "test-project-id",
+			Framework:     "test",
+			Timeout:       5 * time.Second,
+			FlushTimeout:  2 * time.Second,
+			EnableLogging: true,
+		},
+		transport: tr,
+	}
+	return c, tr
+}
+
+func TestEnableLogging_EmitRoutesToLogRecord(t *testing.T) {
+	t.Parallel()
+	c, tr := newLogTestClient()
+	c.NewLogger(context.Background()).Info().Emit("hello log")
+	c.Flush()
+
+	logs := tr.capturedLogs()
+	if len(logs) != 1 {
+		t.Fatalf("want 1 log record, got %d", len(logs))
+	}
+	if logs[0].Level != string(LevelInfo) {
+		t.Errorf("Level = %q, want %q", logs[0].Level, string(LevelInfo))
+	}
+	if logs[0].Message != "hello log" {
+		t.Errorf("Message = %q, want %q", logs[0].Message, "hello log")
+	}
+	// Nothing should go to the event endpoint.
+	if events := tr.capturedEvents(); len(events) != 0 {
+		t.Errorf("want 0 events, got %d — log record must not route to events", len(events))
+	}
+}
+
+func TestEnableLogging_EmitfRoutesToLogRecord(t *testing.T) {
+	t.Parallel()
+	c, tr := newLogTestClient()
+	c.NewLogger(context.Background()).Error().Emitf("request %d failed", 42)
+	c.Flush()
+
+	logs := tr.capturedLogs()
+	if len(logs) != 1 {
+		t.Fatalf("want 1 log record, got %d", len(logs))
+	}
+	if logs[0].Message != "request 42 failed" {
+		t.Errorf("Message = %q, want %q", logs[0].Message, "request 42 failed")
+	}
+}
+
+func TestEnableLogging_FalseUsesEventPath(t *testing.T) {
+	t.Parallel()
+	// Use a logCaptureTransport but with EnableLogging: false — Emit should
+	// route to CaptureMessage → Send (event path), not SendLog.
+	tr := &logCaptureTransport{}
+	c := &Client{
+		opts: Options{
+			ClientID:      "test-client-id",
+			ClientSecret:  "test-client-secret",
+			ProjectID:     "test-project-id",
+			Framework:     "test",
+			Timeout:       5 * time.Second,
+			FlushTimeout:  2 * time.Second,
+			EnableLogging: false, // explicit: old path
+		},
+		transport: tr,
+	}
+	c.NewLogger(context.Background()).Info().Emit("event path")
+	c.Flush()
+
+	if logs := tr.capturedLogs(); len(logs) != 0 {
+		t.Errorf("want 0 log records when EnableLogging=false, got %d", len(logs))
+	}
+	if events := tr.capturedEvents(); len(events) != 1 {
+		t.Errorf("want 1 event when EnableLogging=false, got %d", len(events))
+	}
+}
+
+func TestEnableLogging_LogRecord_HasTags(t *testing.T) {
+	t.Parallel()
+	c, tr := newLogTestClient()
+	c.NewLogger(context.Background()).
+		Warn().
+		WithTag("order_id", "ORD-001").
+		WithTag("service", "checkout").
+		Emit("near capacity")
+	c.Flush()
+
+	logs := tr.capturedLogs()
+	if len(logs) != 1 {
+		t.Fatalf("want 1 log record, got %d", len(logs))
+	}
+	rec := logs[0]
+	findLogTag := func(key string) string {
+		for _, tag := range rec.Tags {
+			if tag.Key == key {
+				return tag.Value
+			}
+		}
+		return ""
+	}
+	if findLogTag("order_id") != "ORD-001" {
+		t.Errorf("order_id tag = %q, want %q", findLogTag("order_id"), "ORD-001")
+	}
+	if findLogTag("service") != "checkout" {
+		t.Errorf("service tag = %q, want %q", findLogTag("service"), "checkout")
+	}
+}
+
+func TestEnableLogging_AllLevels(t *testing.T) {
+	t.Parallel()
+	levels := []struct {
+		call func(l *Logger) *LogEntry
+		want Level
+	}{
+		{(*Logger).Debug, LevelDebug},
+		{(*Logger).Info, LevelInfo},
+		{(*Logger).Warn, LevelWarning},
+		{(*Logger).Error, LevelError},
+		{(*Logger).Fatal, LevelFatal},
+	}
+	for _, tt := range levels {
+		tt := tt
+		t.Run(string(tt.want), func(t *testing.T) {
+			t.Parallel()
+			c, tr := newLogTestClient()
+			tt.call(c.NewLogger(context.Background())).Emit("level test")
+			c.Flush()
+
+			logs := tr.capturedLogs()
+			if len(logs) != 1 {
+				t.Fatalf("[%s] want 1 log record, got %d", tt.want, len(logs))
+			}
+			if logs[0].Level != string(tt.want) {
+				t.Errorf("[%s] Level = %q, want %q", tt.want, logs[0].Level, string(tt.want))
+			}
+		})
+	}
+}
+
+func TestEnableLogging_LogRecord_HasSDKInfo(t *testing.T) {
+	t.Parallel()
+	c, tr := newLogTestClient()
+	c.NewLogger(context.Background()).Info().Emit("sdk test")
+	c.Flush()
+
+	logs := tr.capturedLogs()
+	if len(logs) != 1 {
+		t.Fatalf("want 1 log record, got %d", len(logs))
+	}
+	if logs[0].SDK == nil {
+		t.Fatal("LogRecord.SDK must not be nil")
+	}
+	if logs[0].SDK.Name == "" {
+		t.Error("LogRecord.SDK.Name must not be empty")
+	}
+	if logs[0].ID == "" {
+		t.Error("LogRecord.ID must not be empty")
+	}
+	if logs[0].Timestamp.IsZero() {
+		t.Error("LogRecord.Timestamp must not be zero")
+	}
+}

@@ -31,7 +31,7 @@ type Logger struct {
 // The context propagates active span / hub information to every emitted event
 // so logs are automatically correlated with the current request trace.
 func (c *Client) NewLogger(ctx context.Context) *Logger {
-	return &Logger{client: c, ctx: ctx}
+	return &Logger{client: c, ctx: ctx} // nil client is handled safely in LogEntry.Emit/Emitf
 }
 
 // WithTag returns a new Logger that prepends key/value to every log entry
@@ -99,13 +99,39 @@ func (e *LogEntry) WithTag(key, value string) *LogEntry {
 // adjacent non-string operands are space-separated, same as [fmt.Print].
 //
 //	logger.Info().Emit("Hello ", "world!")
+//
+// When [Options.EnableLogging] is true the entry is stored as a [LogRecord]
+// via POST /api/v1/logs (separate from the events table).
+// When false, it falls through to [Client.CaptureMessage] for backward
+// compatibility.
 func (e *LogEntry) Emit(args ...any) {
-	e.client.CaptureMessage(e.ctx, fmt.Sprint(args...), e.level, e.tags...)
+	if e.client == nil {
+		return
+	}
+	msg := fmt.Sprint(args...)
+	if e.client.opts.EnableLogging {
+		e.client.captureLogAsync(e.client.newLogRecord(e.level, msg, e.tags))
+		return
+	}
+	e.client.CaptureMessage(e.ctx, msg, e.level, e.tags...)
 }
 
 // Emitf sends the log entry with a [fmt.Sprintf]-formatted message.
 //
 //	logger.Info().Emitf("Hello %v!", "world")
+//
+// When [Options.EnableLogging] is true the entry is stored as a [LogRecord]
+// via POST /api/v1/logs (separate from the events table).
+// When false, it falls through to [Client.CaptureMessage] for backward
+// compatibility.
 func (e *LogEntry) Emitf(format string, args ...any) {
-	e.client.CaptureMessage(e.ctx, fmt.Sprintf(format, args...), e.level, e.tags...)
+	if e.client == nil {
+		return
+	}
+	msg := fmt.Sprintf(format, args...)
+	if e.client.opts.EnableLogging {
+		e.client.captureLogAsync(e.client.newLogRecord(e.level, msg, e.tags))
+		return
+	}
+	e.client.CaptureMessage(e.ctx, msg, e.level, e.tags...)
 }
