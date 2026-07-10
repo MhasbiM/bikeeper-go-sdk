@@ -218,18 +218,25 @@ logger := zap.New(core, zap.AddCaller())
 ## Tracing
 
 ```go
-// Start a transaction (top-level span)
-ctx, tx := bikeeper.StartTransaction(ctx, "order.process")
+// Start a transaction (top-level span). StartTransaction/StartSpan return a
+// single *Span — use span.Context() to get the context for child calls.
+tx := bikeeper.StartTransaction(ctx, "order.process")
 defer tx.Finish()
+ctx = tx.Context()
 
-// Start a child span
-ctx, span := bikeeper.StartSpan(ctx, "db.query")
+// Start a child span from that context — it inherits the parent's TraceID.
+span := bikeeper.StartSpan(ctx, "db.query", bikeeper.WithDescription("SELECT * FROM orders WHERE id = ?"))
 defer span.Finish()
+ctx = span.Context()
 
-// Attach tags to the current hub's scope
+// Tag the span/transaction directly...
+tx.SetTag("http.method", "GET")
+
+// ...or attach tags via the hub's scope so they apply to every event captured
+// through it (SetTag lives on Scope, not Hub).
 hub := bikeeper.GetHubFromContext(ctx)
-hub.SetTag("user_id", "123")
-hub.SetTag("order_id", "abc")
+hub.Scope().SetTag("user_id", "123")
+hub.Scope().SetTag("order_id", "abc")
 ```
 
 ## License
