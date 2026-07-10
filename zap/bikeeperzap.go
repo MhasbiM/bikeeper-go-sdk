@@ -31,7 +31,9 @@ package bikeeperzap
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"reflect"
 
 	bikeeper "github.com/MhasbiM/bikeeper-go-sdk"
 	"go.uber.org/zap"
@@ -141,8 +143,7 @@ func zapLevelToBikeeper(lvl zapcore.Level) bikeeper.Level {
 
 // fieldsToTags encodes zap fields into [bikeeper.Tag] values.
 // It uses [zapcore.NewMapObjectEncoder] to extract field values via the
-// standard zap encoding path — complex types (errors, arrays, objects)
-// are serialised with fmt.Sprintf so no data is silently dropped.
+// standard zap encoding path, then formats each value with formatFieldValue.
 func fieldsToTags(fields []zap.Field) []bikeeper.Tag {
 	if len(fields) == 0 {
 		return nil
@@ -155,8 +156,34 @@ func fieldsToTags(fields []zap.Field) []bikeeper.Tag {
 	for k, v := range enc.Fields {
 		tags = append(tags, bikeeper.Tag{
 			Key:   k,
-			Value: fmt.Sprintf("%v", v),
+			Value: formatFieldValue(v),
 		})
 	}
 	return tags
+}
+
+// formatFieldValue renders a single zap field value as a Tag value string.
+// Scalars, errors, and fmt.Stringers keep their natural %v form (so
+// zap.Error(err) still reads as err.Error(), not a struct dump). Maps,
+// slices, arrays, and structs are JSON-encoded instead — %v on those produces
+// Go's debug syntax (e.g. "map[Content-Type: User-Agent:...]"), which isn't
+// valid JSON and reads poorly in the dashboard; encoding preserves the
+// structure as parseable JSON.
+func formatFieldValue(v any) string {
+	if v == nil {
+		return "<nil>"
+	}
+	if _, ok := v.(error); ok {
+		return fmt.Sprintf("%v", v)
+	}
+	if _, ok := v.(fmt.Stringer); ok {
+		return fmt.Sprintf("%v", v)
+	}
+	switch reflect.ValueOf(v).Kind() {
+	case reflect.Map, reflect.Slice, reflect.Array, reflect.Struct:
+		if b, err := json.Marshal(v); err == nil {
+			return string(b)
+		}
+	}
+	return fmt.Sprintf("%v", v)
 }
