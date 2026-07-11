@@ -198,6 +198,30 @@ func TestSpan_FinishIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestSpan_SetStatus(t *testing.T) {
+	t.Parallel()
+	client, transport, hub := newTracingTestClient(t, 1.0)
+	ctx := SetHubOnContext(context.Background(), hub)
+
+	txn := StartTransaction(ctx, "worker.process")
+	child := StartSpan(txn.Context(), "db.query")
+	child.SetStatus(SpanStatusInternalError)
+	child.Finish()
+	txn.Finish()
+	client.Flush()
+
+	got := transport.captured()
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 transaction sent, got %d", len(got))
+	}
+	if len(got[0].Spans) != 1 {
+		t.Fatalf("expected 1 bundled span, got %d", len(got[0].Spans))
+	}
+	if got[0].Spans[0].Status != SpanStatusInternalError {
+		t.Errorf("Status = %q, want %q", got[0].Spans[0].Status, SpanStatusInternalError)
+	}
+}
+
 // TestSpan_ConcurrentChildSpans exercises the documented cross-goroutine
 // usage pattern (concurrent StartSpan + Finish against a shared parent) under
 // the race detector. Run with `go test -race`.

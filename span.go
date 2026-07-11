@@ -843,6 +843,13 @@ func (s *Span) SetOp(op string) {
 	s.withLock(func() { s.Op = op })
 }
 
+// SetStatus sets the span's final status directly, for non-HTTP operations
+// (e.g. a database query or message-queue publish) where SetHTTPStatus's
+// status-code mapping doesn't apply.
+func (s *Span) SetStatus(status SpanStatus) {
+	s.withLock(func() { s.Status = status })
+}
+
 // SetHTTPStatus maps an HTTP response status code to the span's Status field.
 // 5xx → SpanStatusInternalError, 4xx → SpanStatusError, 3xx/2xx/1xx → SpanStatusOK.
 // The raw code is also stored in span data as "http.status_code" so the frontend
