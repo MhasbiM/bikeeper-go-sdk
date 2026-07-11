@@ -45,6 +45,9 @@ import (
 // clientKey is the key used to store the Bikeeper client on an echo.Context.
 const clientKey = "bikeeper_client"
 
+// hubKey is the key used to store the per-request Hub on an echo.Context.
+const hubKey = "bikeeper_hub"
+
 // Options configures the Bikeeper Echo middleware.
 type Options struct {
 	// Repanic controls whether the middleware re-panics after capturing a panic.
@@ -79,16 +82,34 @@ func New(client *bikeeper.Client, opts Options) echo.MiddlewareFunc {
 	client.SetFramework("echo")
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) (retErr error) {
-			// Make the client available to downstream handlers.
+			// Make the client and a per-request Hub available to downstream
+			// handlers. Handlers should prefer GetHubFromContext so they get
+			// trace-aware capture; GetClientFromContext is kept for back-compat.
 			c.Set(clientKey, client)
+			hub := bikeeper.NewHub(client)
+			c.Set(hubKey, hub)
 
 			req := c.Request()
 
-			// Panic recovery — must run even if c.Next() panics.
+			// Auto-start a root transaction for this request, named by the
+			// matched route pattern (e.g. "GET /orders/:id") rather than the
+			// raw URL, so performance data groups correctly across dynamic
+			// segments instead of fragmenting into one distinct name per
+			// literal ID. Whether this actually gets sent anywhere depends on
+			// the client's TracesSampleRate (default: disabled).
+			ctx := bikeeper.SetHubOnContext(req.Context(), hub)
+			transaction := bikeeper.StartTransaction(ctx, req.Method+" "+c.Path(),
+				bikeeper.WithTransactionSource(bikeeper.SourceRoute))
+			transaction.SetTag("http.method", req.Method)
+			c.SetRequest(req.WithContext(transaction.Context()))
+
+			// Panic recovery — must run even if next(c) panics.
 			defer func() {
 				if r := recover(); r != nil {
 					panicErr := toError(r)
-					captureHTTPEvent(client, c, bikeeper.LevelFatal, panicErr, http.StatusInternalServerError)
+					captureHTTPEvent(client, c, transaction, bikeeper.LevelFatal, panicErr, http.StatusInternalServerError)
+					transaction.SetHTTPStatus(http.StatusInternalServerError)
+					transaction.Finish()
 					if opts.Repanic {
 						panic(r)
 					}
@@ -101,17 +122,17 @@ func New(client *bikeeper.Client, opts Options) echo.MiddlewareFunc {
 			// Call downstream handlers.
 			err := next(c)
 
+			transaction.SetHTTPStatus(c.Response().Status)
+			transaction.Finish()
+
 			// Optionally capture 5xx errors returned by handlers.
 			if !opts.DisableInternalErrorCapture && err != nil {
 				status := errorStatus(err)
 				if status >= http.StatusInternalServerError {
-					captureHTTPEvent(client, c, bikeeper.LevelError, err, status)
+					captureHTTPEvent(client, c, transaction, bikeeper.LevelError, err, status)
 				}
 			}
 
-			// Suppress unused variable warning — req is no longer used directly
-			// after refactoring to captureHTTPEvent, but keep for clarity.
-			_ = req
 			return err
 		}
 	}
@@ -199,7 +220,7 @@ func buildHTTPRequest(c echo.Context) *bikeeper.HTTPRequest {
 
 // captureHTTPEvent builds a full bikeeper.Event with HTTP request context and
 // dispatches it asynchronously via CaptureEventAsync.
-func captureHTTPEvent(client *bikeeper.Client, c echo.Context, level bikeeper.Level, err error, status int) {
+func captureHTTPEvent(client *bikeeper.Client, c echo.Context, transaction *bikeeper.Span, level bikeeper.Level, err error, status int) {
 	req := c.Request()
 	tags := buildTags(req.Method, req.URL.Path, c.RealIP(), req.UserAgent(), status)
 	evt := bikeeper.NewEvent(level, err.Error(), tags...)
@@ -210,7 +231,41 @@ func captureHTTPEvent(client *bikeeper.Client, c echo.Context, level bikeeper.Le
 	}
 	evt.URL = scheme + "://" + req.Host + req.URL.RequestURI()
 	evt.HTTPRequest = buildHTTPRequest(c)
+	attachTraceToEvent(evt, transaction)
 	client.CaptureEventAsync(evt)
+}
+
+// attachTraceToEvent correlates an auto-captured event with the request's
+// active transaction, so panic/5xx events surfaced by this middleware show
+// up linked to their trace in the dashboard.
+func attachTraceToEvent(evt *bikeeper.Event, transaction *bikeeper.Span) {
+	if transaction == nil {
+		return
+	}
+	evt.TraceID = transaction.TraceID
+	if evt.Contexts == nil {
+		evt.Contexts = &bikeeper.Contexts{}
+	}
+	evt.Contexts.Trace = transaction.TraceInfo()
+}
+
+// GetHubFromContext retrieves the per-request Hub stored by the middleware.
+// Use the Hub for trace-aware event capture:
+//
+//	hub := bikeeperecho.GetHubFromContext(c)
+//	hub.WithScope(func(s *bikeeper.Scope) { s.SetTag("user.id", uid) })
+//
+// The returned Hub's internal context carries the request's active
+// transaction/span (see New()'s SetHubOnContext/StartTransaction/SetRequest
+// wiring), so hub.CaptureException / hub.CaptureMessage automatically attach
+// trace context to captured events.
+//
+// Returns nil if the middleware is not registered on this route.
+func GetHubFromContext(c echo.Context) *bikeeper.Hub {
+	if _, ok := c.Get(hubKey).(*bikeeper.Hub); !ok {
+		return nil
+	}
+	return bikeeper.GetHubFromContext(c.Request().Context())
 }
 
 // CaptureMessage captures a message with full HTTP context from the current
@@ -229,6 +284,7 @@ func CaptureMessage(c echo.Context, level bikeeper.Level, message string, tags .
 	}
 	evt.URL = scheme + "://" + req.Host + req.URL.RequestURI()
 	evt.HTTPRequest = buildHTTPRequest(c)
+	attachTraceToEvent(evt, bikeeper.SpanFromContext(req.Context()))
 	client.CaptureEventAsync(evt)
 }
 
@@ -251,5 +307,6 @@ func CaptureException(c echo.Context, err error, tags ...bikeeper.Tag) {
 	}
 	evt.URL = scheme + "://" + req.Host + req.URL.RequestURI()
 	evt.HTTPRequest = buildHTTPRequest(c)
+	attachTraceToEvent(evt, bikeeper.SpanFromContext(req.Context()))
 	client.CaptureEventAsync(evt)
 }

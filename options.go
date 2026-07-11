@@ -56,4 +56,21 @@ type Options struct {
 	// structured-logging feature where logs are a first-class resource alongside
 	// errors.
 	EnableLogging bool
+
+	// TracesSampleRate is the fraction of traces sampled for APM/performance
+	// data (0.0–1.0), rolled once per trace at the root Span's creation
+	// (head-based — every descendant inherits the decision, so a trace is
+	// never partially sampled).
+	//
+	// Defaults to 0 (disabled). Framework middleware (bikeeperfiber,
+	// bikeeperecho) auto-starts a transaction for every HTTP request, so an
+	// opt-in default means upgrading the SDK version alone never silently
+	// starts sending performance data — the app owner turns it on
+	// deliberately, e.g. TracesSampleRate: 1.0 to capture every trace, or a
+	// lower value on high-traffic services. This matches Sentry's own SDKs,
+	// which default TracesSampleRate to 0 for the same reason.
+	//
+	// Span/Tag/Data/TraceID propagation into captured Events is unaffected
+	// regardless of this value — only APM sending is gated.
+	TracesSampleRate float64
 }

@@ -2,8 +2,9 @@ package bikeeper
 
 import (
 	"context"
-	"crypto/rand"
+	cryptorand "crypto/rand"
 	"encoding/hex"
+	mathrand "math/rand"
 	"sync"
 	"time"
 )
@@ -165,9 +166,13 @@ func attachSpanContext(ctx context.Context, ev *Event) {
 		ev.Contexts = &Contexts{}
 	}
 	ev.Contexts.Trace = span.TraceInfo()
-	for k, v := range span.Tags {
-		ev.Tags = append(ev.Tags, Tag{Key: k, Value: v})
-	}
+	// Tags is mutated by SetTag/SetHTTPStatus (possibly from another
+	// goroutine — spans are documented as safe to pass across goroutine
+	// boundaries), so it must be read under the same per-trace lock rather
+	// than ranged over directly.
+	var tags []Tag
+	span.withLock(func() { tags = tagsFromMap(span.Tags) })
+	ev.Tags = append(ev.Tags, tags...)
 }
 
 // applyHTTPContext enriches ev with HTTP request context from scope
@@ -666,22 +671,27 @@ type Span struct {
 	// Data holds arbitrary structured data attached to the span.
 	Data map[string]any
 
-	startTime         time.Time
+	startTime time.Time
+	// endTime is zero until Finish() runs; guarded by txn.mu.
+	endTime           time.Time
 	transactionSource string
 	ctx               context.Context // context carrying this span (+ propagated hub)
+	// txn is the state shared by every Span in this trace — always non-nil
+	// once created via StartTransaction/StartSpan. See transaction.go.
+	txn *transactionState
 }
 
 // newSpanID generates a cryptographically random 64-bit (16 hex char) span ID.
 func newSpanID() string {
 	b := make([]byte, 8)
-	_, _ = rand.Read(b)
+	_, _ = cryptorand.Read(b)
 	return hex.EncodeToString(b)
 }
 
 // newTraceID generates a cryptographically random 128-bit (32 hex char) trace ID.
 func newTraceID() string {
 	b := make([]byte, 16)
-	_, _ = rand.Read(b)
+	_, _ = cryptorand.Read(b)
 	return hex.EncodeToString(b)
 }
 
@@ -713,8 +723,24 @@ func StartTransaction(ctx context.Context, name string, opts ...SpanOption) *Spa
 	for _, opt := range opts {
 		opt(s)
 	}
+	s.txn = newRootTransactionState(ctx, s)
 	s.ctx = context.WithValue(ctx, spanContextKey, s)
 	return s
+}
+
+// newRootTransactionState resolves a *Client via any Hub already on ctx and
+// rolls the head-based sampling decision exactly once. If ctx carries no Hub
+// (or the Hub has no Client), the returned state still lets the Span
+// function normally for trace-ID propagation — Finish() simply never builds
+// or sends a payload, mirroring how Hub.CaptureException already no-ops
+// silently when its client is nil.
+func newRootTransactionState(ctx context.Context, root *Span) *transactionState {
+	txn := &transactionState{root: root}
+	if hub := GetHubFromContext(ctx); hub != nil && hub.client != nil {
+		txn.client = hub.client
+		txn.sampled = mathrand.Float64() < hub.client.opts.TracesSampleRate
+	}
+	return txn
 }
 
 // StartSpan creates a child Span within the current trace.
@@ -738,16 +764,30 @@ func StartSpan(ctx context.Context, op string, opts ...SpanOption) *Span {
 		Data:      make(map[string]any),
 		startTime: time.Now(),
 	}
-	if parent := SpanFromContext(ctx); parent != nil {
+	parent := SpanFromContext(ctx)
+	if parent != nil {
 		s.TraceID = parent.TraceID
 		s.ParentSpanID = parent.SpanID
+		s.txn = parent.txn
 	} else {
 		s.TraceID = newTraceID()
+		s.txn = newRootTransactionState(ctx, s)
 	}
 	for _, opt := range opts {
 		opt(s)
 	}
 	s.ctx = context.WithValue(ctx, spanContextKey, s)
+
+	if parent != nil {
+		// Register onto the shared trace state only now that every
+		// SpanOption has run and every field is final, so nothing ever
+		// observes a half-populated span: the mutex Unlock/Lock pair below
+		// is the synchronization edge that publishes these writes to a
+		// concurrently-running root Finish().
+		s.txn.mu.Lock()
+		s.txn.children = append(s.txn.children, s)
+		s.txn.mu.Unlock()
+	}
 	return s
 }
 
@@ -768,14 +808,27 @@ func (s *Span) Context() context.Context {
 	return s.ctx
 }
 
+// withLock runs fn while holding this span's shared per-trace mutex. Every
+// Span created via StartTransaction/StartSpan has txn set; the nil check
+// only guards a zero-value Span{} built directly (e.g. in tests).
+func (s *Span) withLock(fn func()) {
+	if s.txn == nil {
+		fn()
+		return
+	}
+	s.txn.mu.Lock()
+	defer s.txn.mu.Unlock()
+	fn()
+}
+
 // SetTag adds or updates a string key-value annotation on the span.
 func (s *Span) SetTag(key, value string) {
-	s.Tags[key] = value
+	s.withLock(func() { s.Tags[key] = value })
 }
 
 // SetData adds or updates structured data on the span.
 func (s *Span) SetData(key string, value any) {
-	s.Data[key] = value
+	s.withLock(func() { s.Data[key] = value })
 }
 
 // SetHTTPStatus maps an HTTP response status code to the span's Status field.
@@ -785,22 +838,61 @@ func (s *Span) SetData(key string, value any) {
 //
 //	transaction.SetHTTPStatus(c.Response().StatusCode())
 func (s *Span) SetHTTPStatus(code int) {
-	switch {
-	case code >= 500:
-		s.Status = SpanStatusInternalError
-	case code >= 400:
-		s.Status = SpanStatusError
-	default:
-		s.Status = SpanStatusOK
-	}
-	s.SetData("http.status_code", code)
+	s.withLock(func() {
+		switch {
+		case code >= 500:
+			s.Status = SpanStatusInternalError
+		case code >= 400:
+			s.Status = SpanStatusError
+		default:
+			s.Status = SpanStatusOK
+		}
+		// Inlined rather than calling SetData (sync.Mutex isn't reentrant).
+		s.Data["http.status_code"] = code
+	})
 }
 
-// Finish marks the span as complete.
-// Currently a no-op since Bikeeper focuses on error monitoring (not APM span timing).
-// Always call it with defer for forward-compatibility: defer span.Finish()
+// Finish marks the span as complete. For a root transaction whose trace was
+// sampled (see Options.TracesSampleRate), it builds and asynchronously sends
+// a TransactionPayload containing the transaction's own timing plus every
+// descendant span that had already finished. Child (non-root) spans just
+// finalize their own duration/status in place — only the root ever sends.
+//
+// Safe to call more than once (idempotent) and safe to call from any
+// goroutine. A child span whose Finish() runs after its root transaction has
+// already sent is silently dropped from that payload — child spans must
+// complete before their transaction does; this is a standard APM
+// constraint, not something this package tries to work around.
+//
+//	span := bikeeper.StartSpan(ctx, "db.query", bikeeper.WithDescription("SELECT ..."))
+//	defer span.Finish()
 func (s *Span) Finish() {
-	// Reserved for a future APM timing-span feature.
+	if s == nil || s.txn == nil {
+		return
+	}
+	txn := s.txn
+
+	txn.mu.Lock()
+	if !s.endTime.IsZero() {
+		txn.mu.Unlock()
+		return // already finished
+	}
+	s.endTime = time.Now()
+
+	if txn.root != s {
+		txn.mu.Unlock()
+		return // child span: local state finalized; the root owns sending
+	}
+
+	var payload *TransactionPayload
+	if txn.sampled && txn.client != nil {
+		payload = buildTransactionPayload(s, txn.children, txn.client)
+	}
+	txn.mu.Unlock()
+
+	if payload != nil {
+		txn.client.captureTransactionAsync(payload)
+	}
 }
 
 // TraceInfo returns a TraceInfo struct populated from this span's identifiers.

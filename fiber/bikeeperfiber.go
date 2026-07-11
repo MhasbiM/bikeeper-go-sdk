@@ -111,11 +111,27 @@ func New(client *bikeeper.Client, opts Options) fiber.Handler {
 			hub.Scope().SetHTTPContext(absoluteURL(c), buildHTTPRequest(c), bName, bVersion, osName)
 		}
 
+		// Auto-start a root transaction for this request, named by the
+		// matched route pattern (e.g. "GET /orders/:id") rather than the raw
+		// URL, so performance data groups correctly across dynamic segments
+		// instead of fragmenting into one distinct name per literal ID.
+		// c.SetContext propagates both the hub and the active span so that
+		// downstream c.Context() calls — and GetHubFromContext below — see
+		// them automatically. Whether this actually gets sent anywhere
+		// depends on the client's TracesSampleRate (default: disabled).
+		txnCtx := bikeeper.SetHubOnContext(c.Context(), hub)
+		transaction := bikeeper.StartTransaction(txnCtx, c.Method()+" "+c.Route().Path,
+			bikeeper.WithTransactionSource(bikeeper.SourceRoute))
+		transaction.SetTag("http.method", c.Method())
+		c.SetContext(transaction.Context())
+
 		// Panic recovery — covers panics that propagate through c.Next().
 		defer func() {
 			if r := recover(); r != nil {
 				panicErr := toError(r)
-				capturePanicEvent(client, c, panicErr)
+				capturePanicEvent(client, c, transaction, panicErr)
+				transaction.SetHTTPStatus(http.StatusInternalServerError)
+				transaction.Finish()
 				if opts.Repanic {
 					panic(r)
 				}
@@ -128,6 +144,9 @@ func New(client *bikeeper.Client, opts Options) fiber.Handler {
 		// Call downstream handlers.
 		err := c.Next()
 
+		transaction.SetHTTPStatus(c.Response().StatusCode())
+		transaction.Finish()
+
 		// Capture 5xx errors returned by handlers (e.g. fiber.ErrInternalServerError).
 		// Skip when the handler already captured the event manually via MarkCaptured.
 		alreadyCaptured, _ := c.Locals(capturedKey).(bool)
@@ -135,14 +154,14 @@ func New(client *bikeeper.Client, opts Options) fiber.Handler {
 			if err != nil {
 				status := fiberErrorStatus(err)
 				if status >= http.StatusInternalServerError {
-					captureHTTPEvent(client, c, bikeeper.LevelError, err, status)
+					captureHTTPEvent(client, c, transaction, bikeeper.LevelError, err, status)
 				}
 			} else {
 				// Handler returned nil but may have committed a 5xx response directly.
 				status := c.Response().StatusCode()
 				if status >= http.StatusInternalServerError {
 					captureErr := fmt.Errorf("HTTP %d: %s", status, http.StatusText(status))
-					captureHTTPEvent(client, c, bikeeper.LevelError, captureErr, status)
+					captureHTTPEvent(client, c, transaction, bikeeper.LevelError, captureErr, status)
 				}
 			}
 		}
@@ -171,16 +190,18 @@ func MarkCaptured(c fiber.Ctx) {
 //	hub := bikeeperfiber.GetHubFromContext(c)
 //	hub.WithScope(func(s *bikeeper.Scope) { s.SetTag("user.id", uid) })
 //
+// The returned Hub's internal context carries the request's active
+// transaction/span (see New()'s SetHubOnContext/StartTransaction/SetContext
+// wiring), so hub.CaptureException / hub.CaptureMessage automatically attach
+// trace context to captured events — no call-site changes needed to benefit
+// from this once a transaction is active.
+//
 // Returns nil if the middleware is not registered on this route.
 func GetHubFromContext(c fiber.Ctx) *bikeeper.Hub {
-	v := c.Locals(hubKey)
-	if v == nil {
+	if _, ok := c.Locals(hubKey).(*bikeeper.Hub); !ok {
 		return nil
 	}
-	if h, ok := v.(*bikeeper.Hub); ok {
-		return h
-	}
-	return nil
+	return bikeeper.GetHubFromContext(c.Context())
 }
 
 // GetClientFromContext retrieves the Bikeeper client stored by the middleware.
@@ -278,18 +299,20 @@ func absoluteURL(c fiber.Ctx) string {
 
 // captureHTTPEvent builds a full bikeeper.Event with HTTP request context and
 // dispatches it asynchronously via CaptureEventAsync.
-func captureHTTPEvent(client *bikeeper.Client, c fiber.Ctx, level bikeeper.Level, err error, status int) {
+func captureHTTPEvent(client *bikeeper.Client, c fiber.Ctx, transaction *bikeeper.Span, level bikeeper.Level, err error, status int) {
 	tags := buildTags(c.Method(), c.Path(), c.IP(), c.Get(fiber.HeaderUserAgent), status)
 	evt := bikeeper.NewEvent(level, err.Error(), tags...)
 	enrichWithHTTPContext(evt, c)
+	attachTraceToEvent(evt, transaction)
 	client.CaptureEventAsync(evt)
 }
 
 // capturePanicEvent builds an event with a panic stacktrace and dispatches it.
-func capturePanicEvent(client *bikeeper.Client, c fiber.Ctx, err error) {
+func capturePanicEvent(client *bikeeper.Client, c fiber.Ctx, transaction *bikeeper.Span, err error) {
 	tags := buildTags(c.Method(), c.Path(), c.IP(), c.Get(fiber.HeaderUserAgent), http.StatusInternalServerError)
 	evt := bikeeper.NewEvent(bikeeper.LevelFatal, err.Error(), tags...)
 	enrichWithHTTPContext(evt, c)
+	attachTraceToEvent(evt, transaction)
 	// +3: capturePanicEvent → captureHTTPEvent skipped, but we're not in that path;
 	// skip: capturePanicEvent + buildPanicExceptionValue + captureStacktrace
 	ex := bikeeper.BuildPanicExceptionValue(err, 3)
@@ -301,6 +324,21 @@ func capturePanicEvent(client *bikeeper.Client, c fiber.Ctx, err error) {
 		}
 	}
 	client.CaptureEventAsync(evt)
+}
+
+// attachTraceToEvent correlates an auto-captured event with the request's
+// active transaction, so panic/5xx events surfaced by this middleware show
+// up linked to their trace in the dashboard — the same correlation
+// hub.CaptureException already gets via bikeeper.GetHubFromContext.
+func attachTraceToEvent(evt *bikeeper.Event, transaction *bikeeper.Span) {
+	if transaction == nil {
+		return
+	}
+	evt.TraceID = transaction.TraceID
+	if evt.Contexts == nil {
+		evt.Contexts = &bikeeper.Contexts{}
+	}
+	evt.Contexts.Trace = transaction.TraceInfo()
 }
 
 // CaptureMessage captures a message with full HTTP context from the current

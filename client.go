@@ -39,7 +39,7 @@ const (
 
 // sdkName and sdkVersion identify this SDK in the sdk field of every event.
 const sdkName = "bikeeper-go"
-const sdkVersion = "1.0.0"
+const sdkVersion = "1.1.0"
 
 // Client is the Bikeeper SDK client.
 type Client struct {
@@ -208,6 +208,29 @@ func (c *Client) captureLogAsync(record *LogRecord) {
 		sendCtx, cancel := context.WithTimeout(context.Background(), c.opts.Timeout)
 		defer cancel()
 		if err := ls.SendLog(sendCtx, record); err != nil {
+			if c.opts.OnError != nil {
+				c.opts.OnError(err)
+			}
+		}
+	})
+}
+
+// captureTransactionAsync sends a [TransactionPayload] to the
+// /api/v1/transactions endpoint asynchronously via a background goroutine
+// tracked by wg — mirrors captureLogAsync exactly.
+//
+// If the underlying transport does not implement [transactionSender] (e.g. a
+// test fake that only captures events), the payload is dropped silently — no
+// error is reported and no goroutine is launched.
+func (c *Client) captureTransactionAsync(payload *TransactionPayload) {
+	ts, ok := c.transport.(transactionSender)
+	if !ok {
+		return
+	}
+	c.wg.Go(func() {
+		sendCtx, cancel := context.WithTimeout(context.Background(), c.opts.Timeout)
+		defer cancel()
+		if err := ts.SendTransaction(sendCtx, payload); err != nil {
 			if c.opts.OnError != nil {
 				c.opts.OnError(err)
 			}
