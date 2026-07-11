@@ -86,6 +86,34 @@ func TestSpan_SampledTransactionIsSent(t *testing.T) {
 	}
 }
 
+// TestSpan_SetOpRenamesBeforeFinish exercises the exact sequencing framework
+// middleware needs: start a transaction with a provisional name, then rename
+// it (SetOp) once the real name is known, before Finish() sends it.
+func TestSpan_SetOpRenamesBeforeFinish(t *testing.T) {
+	t.Parallel()
+	client, transport, hub := newTracingTestClient(t, 1.0)
+	ctx := SetHubOnContext(context.Background(), hub)
+
+	txn := StartTransaction(ctx, "GET /") // provisional, matches the observed bug's placeholder
+	txn.SetOp("GET /api/v1/orders/:id")   // resolved after routing completes
+	txn.Finish()
+	client.Flush()
+
+	got := transport.captured()
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 transaction sent, got %d", len(got))
+	}
+	if got[0].Op != "GET /api/v1/orders/:id" {
+		t.Errorf("Op = %q, want the renamed value %q", got[0].Op, "GET /api/v1/orders/:id")
+	}
+
+	// TraceInfo() must also reflect the rename (it's what gets attached to
+	// error events captured within this span).
+	if info := txn.TraceInfo(); info.Op != "GET /api/v1/orders/:id" {
+		t.Errorf("TraceInfo().Op = %q, want the renamed value %q", info.Op, "GET /api/v1/orders/:id")
+	}
+}
+
 func TestSpan_BundlesFinishedChildSpans(t *testing.T) {
 	t.Parallel()
 	client, transport, hub := newTracingTestClient(t, 1.0)

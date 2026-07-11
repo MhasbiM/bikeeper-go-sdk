@@ -831,6 +831,18 @@ func (s *Span) SetData(key string, value any) {
 	s.withLock(func() { s.Data[key] = value })
 }
 
+// SetOp updates the span's operation name after creation. Framework
+// middleware uses this to correct an HTTP transaction's name once route
+// matching resolves to the actual endpoint pattern — e.g. Fiber's
+// c.Route().Path is only accurate after c.Next() returns, but the
+// transaction must already be started (and sampling decided) before
+// c.Next() so that child spans created inside the handler have something to
+// attach to. Since Op is now mutable post-creation, TraceInfo() reads it
+// under the same lock rather than treating it as immutable-after-publish.
+func (s *Span) SetOp(op string) {
+	s.withLock(func() { s.Op = op })
+}
+
 // SetHTTPStatus maps an HTTP response status code to the span's Status field.
 // 5xx → SpanStatusInternalError, 4xx → SpanStatusError, 3xx/2xx/1xx → SpanStatusOK.
 // The raw code is also stored in span data as "http.status_code" so the frontend
@@ -898,12 +910,18 @@ func (s *Span) Finish() {
 // TraceInfo returns a TraceInfo struct populated from this span's identifiers.
 // It is attached to Events captured within the span so the frontend can render
 // the Trace Details card with description, op, parent span ID, etc.
+//
+// Op is read under the span's shared lock since SetOp can mutate it after
+// creation (unlike TraceID/SpanID/ParentSpanID/Description, which are set
+// once before the span is ever published and stay safely lock-free).
 func (s *Span) TraceInfo() *TraceInfo {
+	var op string
+	s.withLock(func() { op = s.Op })
 	return &TraceInfo{
 		TraceID:      s.TraceID,
 		SpanID:       s.SpanID,
 		ParentSpanID: s.ParentSpanID,
-		Op:           s.Op,
+		Op:           op,
 		Description:  s.Description,
 	}
 }
