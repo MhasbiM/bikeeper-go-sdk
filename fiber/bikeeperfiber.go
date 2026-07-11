@@ -111,24 +111,48 @@ func New(client *bikeeper.Client, opts Options) fiber.Handler {
 			hub.Scope().SetHTTPContext(absoluteURL(c), buildHTTPRequest(c), bName, bVersion, osName)
 		}
 
-		// Auto-start a root transaction for this request, named by the
-		// matched route pattern (e.g. "GET /orders/:id") rather than the raw
-		// URL, so performance data groups correctly across dynamic segments
-		// instead of fragmenting into one distinct name per literal ID.
+		// Auto-start a root transaction for this request. The name given
+		// here is provisional (method + raw path): Fiber only resolves
+		// c.Route() to the matched pattern (e.g. "/orders/:id") once routing
+		// reaches the terminal handler, which hasn't happened yet at this
+		// point in a globally-registered Use middleware — reading
+		// c.Route().Path here returns this middleware's OWN registration
+		// path ("/"), not the endpoint's. It's corrected via SetOp below
+		// once the real route is known. Starting the transaction now
+		// (rather than after c.Next()) is what lets child spans created
+		// inside the handler attach to it.
 		// c.SetContext propagates both the hub and the active span so that
 		// downstream c.Context() calls — and GetHubFromContext below — see
 		// them automatically. Whether this actually gets sent anywhere
 		// depends on the client's TracesSampleRate (default: disabled).
 		txnCtx := bikeeper.SetHubOnContext(c.Context(), hub)
-		transaction := bikeeper.StartTransaction(txnCtx, c.Method()+" "+c.Route().Path,
+		transaction := bikeeper.StartTransaction(txnCtx, c.Method()+" "+c.Path(),
 			bikeeper.WithTransactionSource(bikeeper.SourceRoute))
 		transaction.SetTag("http.method", c.Method())
 		c.SetContext(transaction.Context())
+
+		// renameToMatchedRoute corrects the transaction's name to the
+		// matched route pattern now that Fiber has resolved it — guaranteed
+		// true by the time either call site below runs: either c.Next()
+		// returned normally, or a panic propagated from within the
+		// already-matched handler itself.
+		renameToMatchedRoute := func() {
+			if route := c.Route(); route != nil && route.Path != "" {
+				transaction.SetOp(c.Method() + " " + route.Path)
+			}
+		}
 
 		// Panic recovery — covers panics that propagate through c.Next().
 		defer func() {
 			if r := recover(); r != nil {
 				panicErr := toError(r)
+				// Rename before capturing so the panic event's attached trace
+				// info reflects the final transaction name, not the
+				// provisional one — c.Route() itself is already accurate
+				// here (the panic only reaches this point via a c.Next()
+				// call that already progressed into the matched handler),
+				// but transaction.Op only updates once SetOp actually runs.
+				renameToMatchedRoute()
 				capturePanicEvent(client, c, transaction, panicErr)
 				transaction.SetHTTPStatus(http.StatusInternalServerError)
 				transaction.Finish()
@@ -144,6 +168,7 @@ func New(client *bikeeper.Client, opts Options) fiber.Handler {
 		// Call downstream handlers.
 		err := c.Next()
 
+		renameToMatchedRoute()
 		transaction.SetHTTPStatus(c.Response().StatusCode())
 		transaction.Finish()
 

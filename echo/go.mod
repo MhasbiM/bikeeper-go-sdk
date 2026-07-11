@@ -3,7 +3,7 @@ module github.com/MhasbiM/bikeeper-go-sdk/echo
 go 1.26.2
 
 require (
-	github.com/MhasbiM/bikeeper-go-sdk v1.1.0
+	github.com/MhasbiM/bikeeper-go-sdk v1.1.1
 	github.com/labstack/echo/v4 v4.12.0
 )
 

@@ -3,7 +3,7 @@ module github.com/MhasbiM/bikeeper-go-sdk/fiber
 go 1.26.2
 
 require (
-	github.com/MhasbiM/bikeeper-go-sdk v1.1.0
+	github.com/MhasbiM/bikeeper-go-sdk v1.1.1
 	github.com/gofiber/fiber/v3 v3.0.0-beta.4
 )
 
