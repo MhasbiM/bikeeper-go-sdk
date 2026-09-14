@@ -173,8 +173,12 @@ func New(client *bikeeper.Client, opts Options) fiber.Handler {
 		transaction.Finish()
 
 		// Capture 5xx errors returned by handlers (e.g. fiber.ErrInternalServerError).
-		// Skip when the handler already captured the event manually via MarkCaptured.
-		alreadyCaptured, _ := c.Locals(capturedKey).(bool)
+		// Skip when this request already produced an event: the handler called
+		// MarkCaptured, or something captured through the request's hub — an
+		// error log carrying the request context, say. Both describe the same
+		// failure, and the one from the call site has the better stack trace.
+		marked, _ := c.Locals(capturedKey).(bool)
+		alreadyCaptured := marked || hub.HasCaptured()
 		if !opts.DisableInternalErrorCapture && !alreadyCaptured {
 			if err != nil {
 				status := fiberErrorStatus(err)

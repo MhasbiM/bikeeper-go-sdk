@@ -20,6 +20,22 @@
 //	    zap.Int("attempt", 3),
 //	)
 //
+// # Carrying request context
+//
+// A log line knows nothing about the request it happened in, so by default a
+// forwarded event arrives with a stack trace and little else. Hand the core the
+// context and the event picks up the active trace, the request URL, the user,
+// and the breadcrumb trail that Bikeeper already tracks for it:
+//
+//	log := bikeeperzap.WithContext(u.log, ctx)
+//	log.Error("checkout failed", zap.Error(err))
+//
+//	// or per call:
+//	u.log.Error("checkout failed", zap.Error(err), bikeeperzap.Ctx(ctx))
+//
+// [Ctx] is invisible to every other core: it encodes to nothing, so console and
+// file output are unchanged.
+//
 // # Build from scratch (tee two cores)
 //
 //	core := zapcore.NewTee(
@@ -43,6 +59,66 @@ import (
 
 // Compile-time proof that Core implements zapcore.Core.
 var _ zapcore.Core = (*Core)(nil)
+
+// ctxFieldKey names the pseudo-field [Ctx] uses to hand a context.Context to
+// the Bikeeper core. It is deliberately not a plausible user field name.
+const ctxFieldKey = "__bikeeper_ctx"
+
+// ctxCarrier smuggles a context.Context through zap's field list.
+type ctxCarrier struct{ ctx context.Context }
+
+// Ctx returns a zap field that hands ctx to the Bikeeper core, so events
+// forwarded from this log call are enriched with whatever ctx carries: the
+// active span's trace, and — on a served request — the hub's scope (URL, HTTP
+// request, user, breadcrumbs, tags).
+//
+//	u.log.Error("checkout failed", zap.Error(err), bikeeperzap.Ctx(ctx))
+//
+// The field is of zap's skip type, so no other core (console, file, JSON) ever
+// renders it — it exists only for the Bikeeper core to pick up.
+func Ctx(ctx context.Context) zap.Field {
+	return zap.Field{Key: ctxFieldKey, Type: zapcore.SkipType, Interface: ctxCarrier{ctx: ctx}}
+}
+
+// WithContext returns a logger whose Bikeeper core captures with ctx. It is
+// shorthand for logger.With(Ctx(ctx)) and is the convenient form when a
+// function already derives a scoped logger:
+//
+//	log := bikeeperzap.WithContext(u.log, ctx).With(zap.String("method", "GetSetting"))
+func WithContext(logger *zap.Logger, ctx context.Context) *zap.Logger {
+	if logger == nil {
+		return nil
+	}
+	return logger.With(Ctx(ctx))
+}
+
+// extractContext splits a context handed over by [Ctx] out of fields. It
+// returns a nil context and the original slice when there is none, which is
+// the common case and allocates nothing.
+func extractContext(fields []zap.Field) (context.Context, []zap.Field) {
+	found := -1
+	var ctx context.Context
+	for i, f := range fields {
+		if f.Key != ctxFieldKey {
+			continue
+		}
+		if carrier, ok := f.Interface.(ctxCarrier); ok && carrier.ctx != nil {
+			ctx = carrier.ctx
+			found = i
+		}
+	}
+	if found < 0 {
+		return nil, fields
+	}
+	rest := make([]zap.Field, 0, len(fields)-1)
+	for i, f := range fields {
+		if i == found || f.Key == ctxFieldKey {
+			continue
+		}
+		rest = append(rest, f)
+	}
+	return ctx, rest
+}
 
 // Core is a [zapcore.Core] that forwards log entries to the Bikeeper client.
 // Use [NewCore] to construct it and [zapcore.NewTee] to combine with your
@@ -83,6 +159,10 @@ func (c *Core) Enabled(lvl zapcore.Level) bool { return lvl >= c.min }
 // Accumulated fields are merged into every subsequent [Core.Write] call.
 func (c *Core) With(fields []zap.Field) zapcore.Core {
 	cp := *c
+	if ctx, rest := extractContext(fields); ctx != nil {
+		cp.ctx = ctx
+		fields = rest
+	}
 	cp.fields = make([]zap.Field, len(c.fields)+len(fields))
 	copy(cp.fields, c.fields)
 	copy(cp.fields[len(c.fields):], fields)
@@ -105,10 +185,17 @@ func (c *Core) Write(entry zapcore.Entry, fields []zap.Field) error {
 	if c.client == nil {
 		return nil
 	}
+	ctx, fields := extractContext(fields)
+	if ctx == nil {
+		ctx = c.ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	level := zapLevelToBikeeper(entry.Level)
 	allFields := append(c.fields, fields...) //nolint:gocritic // intentional append-to-slice
 	tags := fieldsToTags(allFields)
-	c.client.CaptureMessage(c.ctx, messageWithError(entry.Message, tags), level, tags...)
+	c.client.CaptureMessage(ctx, messageWithError(entry.Message, tags), level, tags...)
 	return nil
 }
 

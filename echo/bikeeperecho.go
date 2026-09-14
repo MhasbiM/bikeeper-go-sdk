@@ -125,8 +125,11 @@ func New(client *bikeeper.Client, opts Options) echo.MiddlewareFunc {
 			transaction.SetHTTPStatus(c.Response().Status)
 			transaction.Finish()
 
-			// Optionally capture 5xx errors returned by handlers.
-			if !opts.DisableInternalErrorCapture && err != nil {
+			// Optionally capture 5xx errors returned by handlers. Skipped when
+			// this request already produced an event through its hub (e.g. an
+			// error log carrying the request context), since both describe the
+			// same failure — see Hub.HasCaptured.
+			if !opts.DisableInternalErrorCapture && !hub.HasCaptured() && err != nil {
 				status := errorStatus(err)
 				if status >= http.StatusInternalServerError {
 					captureHTTPEvent(client, c, transaction, bikeeper.LevelError, err, status)

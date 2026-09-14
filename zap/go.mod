@@ -3,7 +3,7 @@ module github.com/MhasbiM/bikeeper-go-sdk/zap
 go 1.26.2
 
 require (
-	github.com/MhasbiM/bikeeper-go-sdk v1.0.0
+	github.com/MhasbiM/bikeeper-go-sdk v1.2.0
 	go.uber.org/zap v1.28.0
 )
 

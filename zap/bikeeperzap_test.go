@@ -1,10 +1,12 @@
 package bikeeperzap_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 
@@ -403,6 +405,106 @@ func TestCore_Write_ExceptionValueMatchesMessage(t *testing.T) {
 	}
 	if got := findTag(events[0], "error"); got != "connection refused" {
 		t.Errorf("error tag = %q, want %q", got, "connection refused")
+	}
+}
+
+// ─── Context handover ────────────────────────────────────────────────────────
+
+// A log call that hands over the request context should produce an event
+// carrying that request's trace and scope, and should tell the hub that this
+// request has already reported something.
+func TestCore_Write_ContextEnrichesEvent(t *testing.T) {
+	t.Parallel()
+	client, tr := newTestClient()
+	core := bikeeperzap.NewCore(client, context.Background(), zapcore.DebugLevel)
+
+	hub := bikeeper.NewHub(client)
+	hub.SetUser(bikeeper.User{ID: "usr-42"})
+	ctx := bikeeper.SetHubOnContext(context.Background(), hub)
+	span := bikeeper.StartTransaction(ctx, "mq.consume.void_item")
+	defer span.Finish()
+
+	entry := zapcore.Entry{Level: zapcore.ErrorLevel, Message: "handler failed"}
+	if err := core.Write(entry, []zap.Field{bikeeperzap.Ctx(span.Context())}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	events := flushAndCapture(client, tr)
+	if len(events) != 1 {
+		t.Fatalf("want 1 event, got %d", len(events))
+	}
+	ev := events[0]
+	if ev.TraceID != span.TraceID {
+		t.Errorf("TraceID = %q, want %q", ev.TraceID, span.TraceID)
+	}
+	if ev.Contexts == nil || ev.Contexts.Trace == nil {
+		t.Fatal("event should carry trace context")
+	}
+	if ev.User == nil || ev.User.ID != "usr-42" {
+		t.Errorf("User = %+v, want ID usr-42", ev.User)
+	}
+	if !hub.HasCaptured() {
+		t.Error("hub should be marked as having captured an event")
+	}
+	if got := findTag(ev, bikeeperzapCtxKey); got != "" {
+		t.Errorf("the context field must not become a tag, got %q", got)
+	}
+}
+
+// bikeeperzapCtxKey mirrors the unexported pseudo-field key used by Ctx; the
+// test asserts it never reaches the tag panel.
+const bikeeperzapCtxKey = "__bikeeper_ctx"
+
+func TestCore_With_ContextIsInherited(t *testing.T) {
+	t.Parallel()
+	client, tr := newTestClient()
+	core := bikeeperzap.NewCore(client, context.Background(), zapcore.DebugLevel)
+
+	hub := bikeeper.NewHub(client)
+	ctx := bikeeper.SetHubOnContext(context.Background(), hub)
+	span := bikeeper.StartTransaction(ctx, "usecase.CreateOrder")
+	defer span.Finish()
+
+	scoped := core.With([]zap.Field{bikeeperzap.Ctx(span.Context()), zap.String("method", "CreateOrder")})
+	entry := zapcore.Entry{Level: zapcore.ErrorLevel, Message: "write failed"}
+	if err := scoped.Write(entry, nil); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	events := flushAndCapture(client, tr)
+	if len(events) != 1 {
+		t.Fatalf("want 1 event, got %d", len(events))
+	}
+	if events[0].TraceID != span.TraceID {
+		t.Errorf("TraceID = %q, want %q", events[0].TraceID, span.TraceID)
+	}
+	if got := findTag(events[0], "method"); got != "CreateOrder" {
+		t.Errorf("method tag = %q, want CreateOrder", got)
+	}
+	if got := findTag(events[0], bikeeperzapCtxKey); got != "" {
+		t.Errorf("the context field must not become a tag, got %q", got)
+	}
+}
+
+// The pseudo-field must stay invisible to every other core in the tee: zap
+// renders skip-type fields as nothing, so real encoder output is unchanged.
+func TestCtx_IsSkippedByOtherEncoders(t *testing.T) {
+	t.Parallel()
+	client, _ := newTestClient()
+
+	var buf bytes.Buffer
+	enc := zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig())
+	console := zapcore.NewCore(enc, zapcore.AddSync(&buf), zapcore.DebugLevel)
+	logger := bikeeperzap.AttachTo(zap.New(console), client, context.Background(), zapcore.DebugLevel)
+
+	bikeeperzap.WithContext(logger, context.Background()).Error("boom", zap.String("order_id", "42"))
+
+	out := buf.String()
+	if strings.Contains(out, bikeeperzapCtxKey) {
+		t.Errorf("context field leaked into encoded output: %s", out)
+	}
+	if !strings.Contains(out, `"order_id":"42"`) {
+		t.Errorf("regular fields should still be encoded, got: %s", out)
 	}
 }
 
