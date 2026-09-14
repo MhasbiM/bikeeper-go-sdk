@@ -1,7 +1,11 @@
 package bikeeper_test
 
 import (
+	"context"
+	"errors"
 	"runtime"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -78,5 +82,190 @@ func TestClientClose_FlushesInFlightEvents(t *testing.T) {
 		// pass
 	case <-time.After(2 * time.Second):
 		t.Error("Client.Close() did not return within 2s — possible deadlock or hang")
+	}
+}
+
+// ─── BeforeSend ──────────────────────────────────────────────────────────────
+
+// fakeTransport records events instead of sending them, and optionally blocks
+// in Send so a test can fill the send queue.
+type fakeTransport struct {
+	mu     sync.Mutex
+	events []*bikeeper.Event
+	block  chan struct{} // when non-nil, Send waits on it before returning
+}
+
+func (t *fakeTransport) Send(_ context.Context, event *bikeeper.Event) error {
+	if t.block != nil {
+		<-t.block
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.events = append(t.events, event)
+	return nil
+}
+
+func (t *fakeTransport) Flush(_ context.Context) {}
+
+func (t *fakeTransport) captured() []*bikeeper.Event {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]*bikeeper.Event, len(t.events))
+	copy(out, t.events)
+	return out
+}
+
+func newFakeClient(t *testing.T, tr *fakeTransport, opts bikeeper.Options) *bikeeper.Client {
+	t.Helper()
+	opts.ProjectID = "test-project"
+	opts.ClientID = "test-client"
+	opts.ClientSecret = "test-secret"
+	return bikeeper.NewWithTransport(tr, opts)
+}
+
+func TestBeforeSend_CanScrubAndDrop(t *testing.T) {
+	t.Parallel()
+	tr := &fakeTransport{}
+	client := newFakeClient(t, tr, bikeeper.Options{
+		BeforeSend: func(ev *bikeeper.Event) *bikeeper.Event {
+			if ev.Level == bikeeper.LevelInfo {
+				return nil // drop routine noise entirely
+			}
+			ev.Tags = slices.DeleteFunc(ev.Tags, func(tag bikeeper.Tag) bool {
+				return tag.Key == "args"
+			})
+			return ev
+		},
+	})
+
+	client.CaptureMessage(context.Background(), "routine", bikeeper.LevelInfo)
+	client.CaptureMessage(context.Background(), "db query failed", bikeeper.LevelError,
+		bikeeper.Tag{Key: "args", Value: `["0812xxxxxxx"]`},
+		bikeeper.Tag{Key: "sql", Value: "SELECT 1"},
+	)
+	client.Flush()
+
+	events := tr.captured()
+	if len(events) != 1 {
+		t.Fatalf("want 1 event delivered (the info one dropped), got %d", len(events))
+	}
+	for _, tag := range events[0].Tags {
+		if tag.Key == "args" {
+			t.Errorf("args tag should have been scrubbed, got %q", tag.Value)
+		}
+	}
+}
+
+func TestBeforeSend_PanicDropsEventWithoutCrashing(t *testing.T) {
+	t.Parallel()
+	tr := &fakeTransport{}
+	var reported error
+	client := newFakeClient(t, tr, bikeeper.Options{
+		BeforeSend: func(*bikeeper.Event) *bikeeper.Event { panic("boom") },
+		OnError:    func(err error) { reported = err },
+	})
+
+	client.CaptureMessage(context.Background(), "anything", bikeeper.LevelError)
+	client.Flush()
+
+	if got := len(tr.captured()); got != 0 {
+		t.Errorf("want 0 events delivered, got %d", got)
+	}
+	if reported == nil {
+		t.Error("a panicking BeforeSend should be reported through OnError")
+	}
+}
+
+// ─── Send queue ──────────────────────────────────────────────────────────────
+
+func TestSendQueue_DropsWhenFull(t *testing.T) {
+	t.Parallel()
+	block := make(chan struct{})
+	tr := &fakeTransport{block: block}
+	client := newFakeClient(t, tr, bikeeper.Options{
+		MaxQueueSize:    2,
+		SendConcurrency: 1,
+		Timeout:         time.Second,
+		FlushTimeout:    2 * time.Second,
+	})
+
+	// One send is stuck in the transport, two fit the queue, the rest are lost.
+	for range 20 {
+		client.CaptureMessage(context.Background(), "flood", bikeeper.LevelError)
+	}
+	if client.Dropped() == 0 {
+		t.Fatal("want events dropped once the queue filled up, got none")
+	}
+
+	close(block)
+	client.Flush()
+
+	if delivered := len(tr.captured()); delivered == 0 || delivered > 20 {
+		t.Errorf("want some but not all events delivered, got %d", delivered)
+	}
+}
+
+// ─── Context-aware capture ───────────────────────────────────────────────────
+
+func TestCaptureException_AttachesHubScopeAndTrace(t *testing.T) {
+	t.Parallel()
+	tr := &fakeTransport{}
+	client := newFakeClient(t, tr, bikeeper.Options{})
+
+	hub := bikeeper.NewHub(client)
+	hub.SetUser(bikeeper.User{ID: "usr-7"})
+	ctx := bikeeper.SetHubOnContext(context.Background(), hub)
+	span := bikeeper.StartTransaction(ctx, "mq.consume.void_item")
+	defer span.Finish()
+
+	client.CaptureException(span.Context(), errors.New("handler failed"))
+	client.Flush()
+
+	events := tr.captured()
+	if len(events) != 1 {
+		t.Fatalf("want 1 event, got %d", len(events))
+	}
+	ev := events[0]
+	if ev.TraceID != span.TraceID {
+		t.Errorf("TraceID = %q, want %q", ev.TraceID, span.TraceID)
+	}
+	if ev.User == nil || ev.User.ID != "usr-7" {
+		t.Errorf("User = %+v, want ID usr-7", ev.User)
+	}
+	if ev.Message != "handler failed" {
+		t.Errorf("Message = %q, want %q", ev.Message, "handler failed")
+	}
+	if !hub.HasCaptured() {
+		t.Error("hub should be marked as having captured an event")
+	}
+}
+
+func TestCaptureMessage_WithoutHubStillAttachesTrace(t *testing.T) {
+	t.Parallel()
+	tr := &fakeTransport{}
+	client := newFakeClient(t, tr, bikeeper.Options{})
+
+	span := bikeeper.StartTransaction(context.Background(), "worker.tick")
+	defer span.Finish()
+
+	client.CaptureMessage(span.Context(), "tick failed", bikeeper.LevelError,
+		bikeeper.Tag{Key: "worker", Value: "outbox"})
+	client.Flush()
+
+	events := tr.captured()
+	if len(events) != 1 {
+		t.Fatalf("want 1 event, got %d", len(events))
+	}
+	if events[0].TraceID != span.TraceID {
+		t.Errorf("TraceID = %q, want %q", events[0].TraceID, span.TraceID)
+	}
+	var found bool
+	for _, tag := range events[0].Tags {
+		if tag.Key == "worker" && tag.Value == "outbox" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("per-call tags should survive, got %+v", events[0].Tags)
 	}
 }

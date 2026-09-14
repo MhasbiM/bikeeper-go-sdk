@@ -42,14 +42,19 @@ func (t *httpTransport) Send(ctx context.Context, event *Event) error {
 		return fmt.Errorf("bikeeper: creating request: %w", err)
 	}
 
-	if t.opts.Framework == "" {
-		return fmt.Errorf("bikeeper: Framework not set — register bikeeperfiber.New or bikeeperecho.New middleware before sending events")
+	// A process with no HTTP framework — a queue consumer, a cron job, a CLI —
+	// has no middleware to stamp Options.Framework, and its errors are exactly
+	// the ones nobody is watching a browser tab for. Refusing to send those
+	// would be the wrong trade, so an unset framework reports as plain "go".
+	framework := t.opts.Framework
+	if framework == "" {
+		framework = "go"
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Bikeeper-Client-ID", t.opts.ClientID)
 	req.Header.Set("X-Bikeeper-Client-Secret", t.opts.ClientSecret)
-	req.Header.Set("X-Bikeeper-SDK-Framework", t.opts.Framework)
+	req.Header.Set("X-Bikeeper-SDK-Framework", framework)
 	req.Header.Set("X-Bikeeper-Project-ID", t.opts.ProjectID)
 
 	resp, err := t.client.Do(req)

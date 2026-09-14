@@ -14,6 +14,7 @@ package bikeeper
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"runtime"
@@ -21,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -39,15 +41,24 @@ const (
 
 // sdkName and sdkVersion identify this SDK in the sdk field of every event.
 const sdkName = "bikeeper-go"
-const sdkVersion = "1.1.2"
+const sdkVersion = "1.2.0"
 
 // Client is the Bikeeper SDK client.
 type Client struct {
 	opts      Options
 	transport Transport
-	wg        sync.WaitGroup // tracks in-flight captureAsync goroutines
-	packages  []Package      // cached from runtime/debug.ReadBuildInfo at New() time
-	serverIPs []string       // non-loopback IPs collected once at startup
+	packages  []Package // cached from runtime/debug.ReadBuildInfo at New() time
+	serverIPs []string  // non-loopback IPs collected once at startup
+
+	// Send queue. Every capture hands a task to a fixed pool of sender
+	// goroutines rather than starting one of its own — see enqueue.
+	startOnce sync.Once
+	tasks     chan sendTask
+	pending   sync.WaitGroup // queued + in-flight tasks; Flush waits on this
+	workers   sync.WaitGroup // sender goroutines; Close waits on this
+	closeMu   sync.RWMutex   // guards closed against a concurrent enqueue
+	closed    bool
+	dropped   atomic.Uint64 // events discarded because the queue was full
 
 	mu         sync.RWMutex // protects globalTags
 	globalTags []Tag        // set via SetTag; prepended to every event
@@ -70,10 +81,10 @@ func New(opts Options) *Client {
 		opts.Endpoint = "http://localhost:8080"
 	}
 	if opts.Timeout == 0 {
-		opts.Timeout = 5 * time.Second
+		opts.Timeout = defaultTimeout
 	}
 	if opts.FlushTimeout == 0 {
-		opts.FlushTimeout = 2 * time.Second
+		opts.FlushTimeout = defaultFlushTimeout
 	}
 
 	c := &Client{opts: opts, packages: collectPackages(), serverIPs: collectServerIPs()}
@@ -97,10 +108,10 @@ func NewWithTransport(t Transport, opts Options) *Client {
 		panic("bikeeper: ProjectID must not be empty — copy it from the Bikeeper dashboard")
 	}
 	if opts.Timeout == 0 {
-		opts.Timeout = 5 * time.Second
+		opts.Timeout = defaultTimeout
 	}
 	if opts.FlushTimeout == 0 {
-		opts.FlushTimeout = 2 * time.Second
+		opts.FlushTimeout = defaultFlushTimeout
 	}
 	c := &Client{opts: opts, packages: collectPackages(), serverIPs: collectServerIPs()}
 	c.transport = t
@@ -204,15 +215,7 @@ func (c *Client) captureLogAsync(record *LogRecord) {
 	if !ok {
 		return
 	}
-	c.wg.Go(func() {
-		sendCtx, cancel := context.WithTimeout(context.Background(), c.opts.Timeout)
-		defer cancel()
-		if err := ls.SendLog(sendCtx, record); err != nil {
-			if c.opts.OnError != nil {
-				c.opts.OnError(err)
-			}
-		}
-	})
+	c.enqueue(func(ctx context.Context) error { return ls.SendLog(ctx, record) })
 }
 
 // captureTransactionAsync sends a [TransactionPayload] to the
@@ -227,15 +230,7 @@ func (c *Client) captureTransactionAsync(payload *TransactionPayload) {
 	if !ok {
 		return
 	}
-	c.wg.Go(func() {
-		sendCtx, cancel := context.WithTimeout(context.Background(), c.opts.Timeout)
-		defer cancel()
-		if err := ts.SendTransaction(sendCtx, payload); err != nil {
-			if c.opts.OnError != nil {
-				c.opts.OnError(err)
-			}
-		}
-	})
+	c.enqueue(func(ctx context.Context) error { return ts.SendTransaction(ctx, payload) })
 }
 
 // CaptureException captures an error event and sends it to Bikeeper asynchronously.
@@ -243,49 +238,103 @@ func (c *Client) captureTransactionAsync(payload *TransactionPayload) {
 // to the event as structured exception data (type, message, frames with source
 // context). The grouping fingerprint is computed from the error type + in-app
 // frames so that the same root cause is grouped as one issue in the dashboard.
+//
+// ctx is not merely carried along: whatever it holds is attached to the event —
+// see [Client.captureWithContext].
 func (c *Client) CaptureException(ctx context.Context, err error, tags ...Tag) {
 	if c == nil || err == nil {
 		return
 	}
-	event := NewEvent(LevelError, err.Error(), tags...)
-	ex := buildExceptionValue(err, 1) // skip: CaptureException itself; direct caller is the first captured frame
-	event.Exception = ex
-	if ex.Stacktrace != nil {
-		// fingerprint[0] = all-frames hash, fingerprint[1] = in-app-only hash
-		event.Fingerprint = []string{
-			computeAllFramesGroupingHash(ex.Type, ex.Stacktrace.Frames),
-			computeGroupingHash(ex.Type, ex.Stacktrace.Frames),
-		}
-	}
-	event = c.enrichEvent(event)
-	c.captureAsync(event)
+	// skip=1: CaptureException itself is omitted; its caller is the first frame.
+	c.captureWithContext(ctx, buildExceptionEvent(err, 1), tags)
 }
 
 // CaptureMessage captures a message event and sends it asynchronously.
 // A stacktrace is captured at the call site and attached as exception data so
 // the call-site frame appears in the Bikeeper dashboard alongside the message.
+//
+// ctx is not merely carried along: whatever it holds is attached to the event —
+// see [Client.captureWithContext].
 func (c *Client) CaptureMessage(ctx context.Context, message string, level Level, tags ...Tag) {
 	if c == nil {
 		return
 	}
-	event := NewEvent(level, message, tags...)
-	// skip=1: CaptureMessage itself is omitted; user code is the first visible frame.
-	st := captureStacktrace(1)
+	// skip=1: CaptureMessage itself is omitted; its caller is the first frame.
+	c.captureWithContext(ctx, buildMessageEvent(message, level, 1), tags)
+}
+
+// captureWithContext attaches everything ctx knows about the work in progress
+// before queueing ev.
+//
+// An event without context is a stack trace and nothing else: which request
+// produced it, which user hit it, and which trace it belongs to all have to be
+// guessed from timestamps. Those answers are already in ctx — the active span
+// (from StartSpan / framework middleware) and, on a served request, the Hub
+// holding that request's scope — so this attaches them: trace identifiers from
+// the span, and URL, HTTP request, breadcrumbs, user and scope tags from the
+// hub. This is what makes an error logged deep inside a usecase land on the
+// dashboard already linked to the request and trace that caused it.
+//
+// A hub also learns that this request has now reported something, so framework
+// middleware can skip its own automatic 5xx capture instead of filing the same
+// failure twice.
+func (c *Client) captureWithContext(ctx context.Context, ev *Event, tags []Tag) {
+	hub := GetHubFromContext(ctx)
+	if hub == nil {
+		attachSpanContext(ctx, ev)
+		ev.Tags = append(ev.Tags, tags...)
+		c.captureAsync(c.enrichEvent(ev))
+		return
+	}
+
+	scope := hub.scopeSnapshot()
+	if fp := scope.fingerprint(); fp != nil {
+		ev.Fingerprint = fp
+	}
+	attachSpanContext(ctx, ev)
+	applyHTTPContext(ev, scope)
+	applyScopeData(ev, scope, tags)
+	scope.markCaptured()
+
+	c.captureAsync(c.enrichEvent(ev))
+}
+
+// buildExceptionEvent builds the event for a captured error. skip is how many
+// frames above this call to leave out of the stack trace.
+func buildExceptionEvent(err error, skip int) *Event {
+	ev := NewEvent(LevelError, err.Error())
+	ex := buildExceptionValue(err, skip+1)
+	ev.Exception = ex
+	if ex.Stacktrace != nil {
+		// fingerprint[0] = all-frames hash, fingerprint[1] = in-app-only hash
+		ev.Fingerprint = []string{
+			computeAllFramesGroupingHash(ex.Type, ex.Stacktrace.Frames),
+			computeGroupingHash(ex.Type, ex.Stacktrace.Frames),
+		}
+	}
+	return ev
+}
+
+// buildMessageEvent builds the event for a captured message, attaching the
+// call site as exception data so the dashboard has a frame to show. skip is
+// how many frames above this call to leave out of the stack trace.
+func buildMessageEvent(message string, level Level, skip int) *Event {
+	ev := NewEvent(level, message)
+	st := captureStacktrace(skip + 1)
 	exType := callerFunctionName(st)
-	event.Exception = &ExceptionValue{
+	ev.Exception = &ExceptionValue{
 		Type:       exType,
 		Value:      message,
 		Mechanism:  &ExceptionMechanism{Type: "generic", Handled: true},
 		Stacktrace: st,
 	}
 	if st != nil {
-		event.Fingerprint = []string{
+		ev.Fingerprint = []string{
 			computeAllFramesGroupingHash(exType, st.Frames),
 			computeGroupingHash(exType, st.Frames),
 		}
 	}
-	event = c.enrichEvent(event)
-	c.captureAsync(event)
+	return ev
 }
 
 // Capture sends an event synchronously and returns any transport error.
@@ -316,7 +365,7 @@ func (c *Client) Flush() {
 	}
 	done := make(chan struct{})
 	go func() {
-		c.wg.Wait()
+		c.pending.Wait()
 		close(done)
 	}()
 
@@ -328,27 +377,150 @@ func (c *Client) Flush() {
 	}
 }
 
-// Close flushes remaining events and releases resources.
+// Close flushes remaining events and stops the sender pool. Captures made
+// after Close are dropped (and counted by Dropped) rather than panicking on a
+// closed queue.
 func (c *Client) Close() {
 	if c == nil {
 		return
 	}
 	c.Flush()
+
+	c.closeMu.Lock()
+	alreadyClosed := c.closed
+	c.closed = true
+	if !alreadyClosed && c.tasks != nil {
+		close(c.tasks)
+	}
+	c.closeMu.Unlock()
+
+	if !alreadyClosed {
+		c.workers.Wait()
+	}
 }
 
-// captureAsync sends an event in a background goroutine.
-// The goroutine is tracked by wg so Flush can wait for it.
-// If the send fails and OnError is set, the error is forwarded to the caller.
+// captureAsync runs the event through BeforeSend and queues it for delivery.
+// A nil return from BeforeSend drops the event.
 func (c *Client) captureAsync(event *Event) {
-	c.wg.Go(func() {
-		sendCtx, cancel := context.WithTimeout(context.Background(), c.opts.Timeout)
-		defer cancel()
-		if err := c.transport.Send(sendCtx, event); err != nil {
+	event = c.applyBeforeSend(event)
+	if event == nil {
+		return
+	}
+	c.enqueue(func(ctx context.Context) error { return c.transport.Send(ctx, event) })
+}
+
+// applyBeforeSend gives the application its last look at an enriched event.
+// A panicking BeforeSend drops the event rather than taking the process down
+// with it — this runs on a sender goroutine, where an unrecovered panic would
+// be fatal and entirely unrelated to whatever the app was actually doing.
+func (c *Client) applyBeforeSend(event *Event) (out *Event) {
+	if c.opts.BeforeSend == nil {
+		return event
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			out = nil
 			if c.opts.OnError != nil {
-				c.opts.OnError(err)
+				c.opts.OnError(fmt.Errorf("bikeeper: BeforeSend panicked (%v) — event dropped", r))
 			}
 		}
+	}()
+	return c.opts.BeforeSend(event)
+}
+
+// ─── Send queue ──────────────────────────────────────────────────────────────
+
+// sendTask is one delivery attempt — an event, a log record, or a transaction
+// payload already bound to its destination method.
+type sendTask func(ctx context.Context) error
+
+// enqueue hands task to the sender pool, discarding it when the queue is full.
+//
+// Dropping is deliberate: monitoring must never become the thing that takes
+// the application down. Before this, every capture started its own goroutine
+// and a failing dependency (a slow Bikeeper endpoint, an error storm, or both
+// at once — they arrive together) could pile up thousands of them, each
+// holding an event and a connection for up to Timeout. A bounded queue turns
+// that unbounded memory and socket growth into a counted, reported loss of
+// telemetry, which is the cheaper failure by far. Dropped() reports the count.
+func (c *Client) enqueue(task sendTask) {
+	// The closed check comes first so a capture after Close cannot start a
+	// worker pool that would then never be shut down.
+	c.closeMu.RLock()
+	defer c.closeMu.RUnlock()
+	if c.closed {
+		c.drop("client closed")
+		return
+	}
+	c.ensureWorkers()
+
+	c.pending.Add(1)
+	select {
+	case c.tasks <- task:
+	default:
+		c.pending.Done()
+		c.drop("send queue full")
+	}
+}
+
+// drop counts a discarded payload and reports it through OnError.
+func (c *Client) drop(reason string) {
+	n := c.dropped.Add(1)
+	if c.opts.OnError != nil {
+		c.opts.OnError(fmt.Errorf("bikeeper: %s — payload dropped (%d dropped so far)", reason, n))
+	}
+}
+
+// Dropped returns how many payloads have been discarded because the send
+// queue was full (or the client was already closed). A non-zero, growing
+// count means the endpoint cannot keep up with what the app is capturing:
+// raise MaxQueueSize / SendConcurrency, or capture less.
+func (c *Client) Dropped() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.dropped.Load()
+}
+
+// ensureWorkers starts the sender pool on first use. It is done lazily rather
+// than in New so that a Client built as a struct literal (as some tests do)
+// still delivers.
+func (c *Client) ensureWorkers() {
+	c.startOnce.Do(func() {
+		size := c.opts.MaxQueueSize
+		if size <= 0 {
+			size = defaultMaxQueueSize
+		}
+		concurrency := c.opts.SendConcurrency
+		if concurrency <= 0 {
+			concurrency = defaultSendConcurrency
+		}
+		timeout := c.opts.Timeout
+		if timeout <= 0 {
+			timeout = defaultTimeout
+		}
+
+		c.tasks = make(chan sendTask, size)
+		for range concurrency {
+			c.workers.Go(func() {
+				for task := range c.tasks {
+					c.runTask(task, timeout)
+				}
+			})
+		}
 	})
+}
+
+// runTask executes one queued send, always marking it done so a panicking
+// transport cannot wedge Flush forever.
+func (c *Client) runTask(task sendTask, timeout time.Duration) {
+	defer c.pending.Done()
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := task(ctx); err != nil && c.opts.OnError != nil {
+		c.opts.OnError(err)
+	}
 }
 
 // SetTag sets a global tag that is automatically attached to every event sent

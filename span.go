@@ -81,6 +81,13 @@ func (h *Hub) scopeSnapshot() *Scope {
 // with the span's trace context (TraceID, SpanID, ParentSpanID, Op, Description).
 // A full Go stacktrace is captured at the call site.
 func (h *Hub) CaptureException(err error, tags ...Tag) {
+	h.captureException(err, 1, tags...)
+}
+
+// captureException is CaptureException with an explicit stack-skip count, so
+// [Client.CaptureException] can route through the hub without its own frame
+// showing up as the call site.
+func (h *Hub) captureException(err error, skip int, tags ...Tag) {
 	if h == nil || h.client == nil || err == nil {
 		return
 	}
@@ -90,20 +97,13 @@ func (h *Hub) CaptureException(err error, tags ...Tag) {
 	}
 	scope := h.scopeSnapshot()
 
-	ev := NewEvent(LevelError, err.Error())
-	ex := buildExceptionValue(err, 1)
-	ev.Exception = ex
-	if ex.Type != "" &&
+	ev := buildExceptionEvent(err, skip+1)
+	if ex := ev.Exception; ex != nil &&
+		ex.Type != "" &&
 		ex.Type != "*errors.errorString" &&
 		ex.Type != "*fmt.wrapError" &&
 		ex.Type != "error" {
 		ev.Message = ex.Type
-	}
-	if ex.Stacktrace != nil {
-		ev.Fingerprint = []string{
-			computeAllFramesGroupingHash(ex.Type, ex.Stacktrace.Frames),
-			computeGroupingHash(ex.Type, ex.Stacktrace.Frames),
-		}
 	}
 	if fp := scope.fingerprint(); fp != nil {
 		ev.Fingerprint = fp
@@ -112,6 +112,7 @@ func (h *Hub) CaptureException(err error, tags ...Tag) {
 	attachSpanContext(ctx, ev)
 	applyHTTPContext(ev, scope)
 	applyScopeData(ev, scope, tags)
+	scope.markCaptured()
 
 	h.client.CaptureEventAsync(ev)
 }
@@ -119,6 +120,12 @@ func (h *Hub) CaptureException(err error, tags ...Tag) {
 // CaptureMessage captures a message through the hub's client.
 // If the hub's ctx carries an active Span, the span's trace context is attached.
 func (h *Hub) CaptureMessage(message string, level Level, tags ...Tag) {
+	h.captureMessage(message, level, 1, tags...)
+}
+
+// captureMessage is CaptureMessage with an explicit stack-skip count — see
+// [Hub.captureException].
+func (h *Hub) captureMessage(message string, level Level, skip int, tags ...Tag) {
 	if h == nil || h.client == nil {
 		return
 	}
@@ -128,31 +135,37 @@ func (h *Hub) CaptureMessage(message string, level Level, tags ...Tag) {
 	}
 	scope := h.scopeSnapshot()
 
-	ev := NewEvent(level, message)
-
-	st := captureStacktrace(1)
-	exType := callerFunctionName(st)
-	ev.Exception = &ExceptionValue{
-		Type:       exType,
-		Value:      message,
-		Mechanism:  &ExceptionMechanism{Type: "generic", Handled: true},
-		Stacktrace: st,
-	}
-
+	ev := buildMessageEvent(message, level, skip+1)
 	if fp := scope.fingerprint(); fp != nil {
 		ev.Fingerprint = fp
-	} else if st != nil {
-		ev.Fingerprint = []string{
-			computeAllFramesGroupingHash(exType, st.Frames),
-			computeGroupingHash(exType, st.Frames),
-		}
 	}
 
 	attachSpanContext(ctx, ev)
 	applyHTTPContext(ev, scope)
 	applyScopeData(ev, scope, tags)
+	scope.markCaptured()
 
 	h.client.CaptureEventAsync(ev)
+}
+
+// MarkCaptured records that an event has already been reported for the request
+// this hub belongs to. Framework middleware calls [Hub.HasCaptured] before its
+// own automatic 5xx capture so one failure does not arrive twice.
+func (h *Hub) MarkCaptured() {
+	if h == nil || h.scope == nil {
+		return
+	}
+	h.scope.markCaptured()
+}
+
+// HasCaptured reports whether an event has already been captured through this
+// hub — by a handler calling CaptureException itself, or by a logger
+// integration capturing with the request's context.
+func (h *Hub) HasCaptured() bool {
+	if h == nil || h.scope == nil {
+		return false
+	}
+	return h.scope.hasCaptured()
 }
 
 // attachSpanContext enriches ev with trace information from the active span in ctx.
@@ -422,6 +435,29 @@ type Scope struct {
 	// extras holds named free-form context blocks set via SetContext.
 	// Keys are arbitrary names (e.g. "device", "runtime"); values are ExtraContext maps.
 	extras map[string]ExtraContext
+	// captured records that an event has already been reported through this
+	// scope's hub — see Hub.MarkCaptured.
+	captured bool
+}
+
+// markCaptured flags that this scope's request already has an event.
+func (s *Scope) markCaptured() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.captured = true
+	s.mu.Unlock()
+}
+
+// hasCaptured reports whether markCaptured has been called on this scope.
+func (s *Scope) hasCaptured() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.captured
 }
 
 // SetFingerprint sets a custom grouping fingerprint on the scope. When set, it
