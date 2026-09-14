@@ -84,3 +84,19 @@ func TestHook_PassesErrorsThrough(t *testing.T) {
 		t.Errorf("error = %v, want redis.Nil", got)
 	}
 }
+
+// Outside any transaction — a background job with no hub, or monitoring
+// switched off — the hook must run the command and nothing else.
+func TestHook_WithoutActiveTransactionDoesNothing(t *testing.T) {
+	// Not parallel: AllocsPerRun needs the process to itself.
+	hook := bikeeperredis.NewHook()
+	ctx := context.Background()
+	process := hook.ProcessHook(func(context.Context, redis.Cmder) error { return nil })
+	cmd := redis.NewStringCmd(ctx, "get", "session:got-1")
+
+	if allocs := testing.AllocsPerRun(100, func() {
+		_ = process(ctx, cmd)
+	}); allocs != 0 {
+		t.Errorf("allocations per command = %v, want 0 when tracing is off", allocs)
+	}
+}

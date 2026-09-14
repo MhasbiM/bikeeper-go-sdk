@@ -3,7 +3,7 @@ module github.com/MhasbiM/bikeeper-go-sdk/redis
 go 1.26.2
 
 require (
-	github.com/MhasbiM/bikeeper-go-sdk v1.3.0
+	github.com/MhasbiM/bikeeper-go-sdk v1.3.1
 	github.com/redis/go-redis/v9 v9.16.0
 )
 

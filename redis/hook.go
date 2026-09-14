@@ -68,6 +68,9 @@ func (h *Hook) DialHook(next redis.DialHook) redis.DialHook { return next }
 // it does not mark the span as errored.
 func (h *Hook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return func(ctx context.Context, cmd redis.Cmder) error {
+		if !tracing(ctx) {
+			return next(ctx, cmd)
+		}
 		span := bikeeper.StartSpan(ctx, "redis."+cmd.Name())
 		err := next(ctx, cmd)
 		span.SetData("redis.command", h.describe(cmd))
@@ -81,12 +84,27 @@ func (h *Hook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 // a single round trip, so that is the meaningful unit here.
 func (h *Hook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return func(ctx context.Context, cmds []redis.Cmder) error {
+		if !tracing(ctx) {
+			return next(ctx, cmds)
+		}
 		span := bikeeper.StartSpan(ctx, "redis.pipeline")
 		span.SetData("redis.command_count", len(cmds))
 		err := next(ctx, cmds)
 		finish(span, err)
 		return err
 	}
+}
+
+// tracing reports whether a span started on ctx could ever be sent: either it
+// nests inside one already being recorded, or ctx carries a hub that owns a
+// transaction.
+//
+// Without this check every command on an uninstrumented path — a background
+// job with no transaction, or a process with monitoring switched off entirely
+// — would allocate a span, an ID pair and two maps that Finish then drops.
+// Cache calls are among the hottest paths an application has.
+func tracing(ctx context.Context) bool {
+	return bikeeper.SpanFromContext(ctx) != nil || bikeeper.HasHub(ctx)
 }
 
 func finish(span *bikeeper.Span, err error) {

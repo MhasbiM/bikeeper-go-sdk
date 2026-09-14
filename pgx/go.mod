@@ -3,7 +3,7 @@ module github.com/MhasbiM/bikeeper-go-sdk/pgx
 go 1.26.2
 
 require (
-	github.com/MhasbiM/bikeeper-go-sdk v1.3.0
+	github.com/MhasbiM/bikeeper-go-sdk v1.3.1
 	github.com/jackc/pgx/v5 v5.7.6
 )
 

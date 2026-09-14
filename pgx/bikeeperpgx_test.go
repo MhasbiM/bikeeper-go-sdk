@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 
+	bikeeper "github.com/MhasbiM/bikeeper-go-sdk"
+
 	bikeeperpgx "github.com/MhasbiM/bikeeper-go-sdk/pgx"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/tracelog"
@@ -134,19 +136,43 @@ func TestChain_SkipsMembersWithoutTheOptionalInterface(t *testing.T) {
 	}
 }
 
-// Tracing outside any transaction (a job with no hub, monitoring disabled) is
-// the common case for background work and must be harmless, as must an End
-// call that never saw its Start (a tracer installed mid-flight).
-func TestTracer_WithoutActiveTransaction(t *testing.T) {
-	t.Parallel()
-	tracer := bikeeperpgx.NewTracer(bikeeperpgx.WithMaxSQLLength(10))
+// Outside any transaction — a background job with no hub, or monitoring
+// switched off — the tracer must do nothing at all rather than build spans
+// that can never be sent.
+func TestTracer_WithoutActiveTransactionDoesNothing(t *testing.T) {
+	// Not parallel: AllocsPerRun below needs the process to itself.
+	tracer := bikeeperpgx.NewTracer()
+	ctx := context.Background()
 
-	ctx := tracer.TraceQueryStart(context.Background(), nil, pgx.TraceQueryStartData{SQL: "SELECT a_very_long_statement"})
-	if ctx == context.Background() {
+	if got := tracer.TraceQueryStart(ctx, nil, pgx.TraceQueryStartData{SQL: "SELECT 1"}); got != ctx {
+		t.Error("the context should come back untouched when nothing is listening")
+	}
+	// An End that never saw its Start must also be harmless.
+	tracer.TraceQueryEnd(ctx, nil, pgx.TraceQueryEndData{Err: errors.New("boom")})
+	tracer.TraceBatchEnd(ctx, nil, pgx.TraceBatchEndData{})
+
+	if allocs := testing.AllocsPerRun(100, func() {
+		qctx := tracer.TraceQueryStart(ctx, nil, pgx.TraceQueryStartData{SQL: "SELECT 1"})
+		tracer.TraceQueryEnd(qctx, nil, pgx.TraceQueryEndData{})
+	}); allocs != 0 {
+		t.Errorf("allocations per query = %v, want 0 when tracing is off", allocs)
+	}
+}
+
+// With a transaction in reach, the span is carried on the returned context so
+// TraceQueryEnd can finish it.
+func TestTracer_WithActiveTransaction(t *testing.T) {
+	t.Parallel()
+	client := bikeeper.NewWithTransport(nopTransport{}, bikeeper.Options{
+		ClientID: "id", ClientSecret: "secret", ProjectID: "project",
+	})
+	tracer := bikeeperpgx.NewTracer(bikeeperpgx.WithMaxSQLLength(10))
+	jobCtx, job := bikeeper.StartJob(context.Background(), client, "worker.tick")
+
+	qctx := tracer.TraceQueryStart(jobCtx, nil, pgx.TraceQueryStartData{SQL: "SELECT a_very_long_statement"})
+	if qctx == jobCtx {
 		t.Error("the span should be carried on the returned context")
 	}
-	tracer.TraceQueryEnd(ctx, nil, pgx.TraceQueryEndData{Err: errors.New("boom")})
-
-	tracer.TraceQueryEnd(context.Background(), nil, pgx.TraceQueryEndData{})
-	tracer.TraceBatchEnd(context.Background(), nil, pgx.TraceBatchEndData{})
+	tracer.TraceQueryEnd(qctx, nil, pgx.TraceQueryEndData{Err: errors.New("boom")})
+	bikeeper.FinishJob(job, nil)
 }

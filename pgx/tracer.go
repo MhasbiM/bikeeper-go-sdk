@@ -88,6 +88,9 @@ var (
 )
 
 func (t *Tracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if !tracing(ctx) {
+		return ctx
+	}
 	span := bikeeper.StartSpan(ctx, "db.query", bikeeper.WithDescription(truncate(data.SQL, t.maxSQLLength)))
 	return context.WithValue(ctx, spanContextKey{}, span)
 }
@@ -97,6 +100,9 @@ func (t *Tracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceQ
 }
 
 func (t *Tracer) TraceBatchStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceBatchStartData) context.Context {
+	if !tracing(ctx) {
+		return ctx
+	}
 	span := bikeeper.StartSpan(ctx, "db.batch", bikeeper.WithDescription(fmt.Sprintf("%d statements", data.Batch.Len())))
 	return context.WithValue(ctx, spanContextKey{}, span)
 }
@@ -109,6 +115,19 @@ func (t *Tracer) TraceBatchQuery(_ context.Context, _ *pgx.Conn, _ pgx.TraceBatc
 
 func (t *Tracer) TraceBatchEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceBatchEndData) {
 	finish(ctx, data.Err)
+}
+
+// tracing reports whether a span started on ctx could ever be sent: either it
+// nests inside one already being recorded, or ctx carries a hub that owns a
+// transaction.
+//
+// Without this check every query on an uninstrumented path — a background job
+// with no transaction, or a process with monitoring switched off entirely —
+// would allocate a span, an ID pair and two maps that Finish then drops on the
+// floor. Queries are the hottest path an application has; work done there for
+// nothing is worth not doing.
+func tracing(ctx context.Context) bool {
+	return bikeeper.SpanFromContext(ctx) != nil || bikeeper.HasHub(ctx)
 }
 
 // finish closes the span stored on ctx, marking it failed when the operation
