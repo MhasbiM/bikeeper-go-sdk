@@ -2,6 +2,7 @@ package bikeeperzap_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -296,6 +297,112 @@ func TestCore_Write_Message(t *testing.T) {
 	}
 	if events[0].Message != "hello zap" {
 		t.Errorf("Message = %q, want %q", events[0].Message, "hello zap")
+	}
+}
+
+// ─── Core.Write — error-aware message ────────────────────────────────────────
+
+func TestCore_Write_MessageFoldsInLoggedError(t *testing.T) {
+	t.Parallel()
+
+	queryErr := errors.New(`ERROR: column "use_self_order" does not exist (SQLSTATE 42703)`)
+
+	tests := []struct {
+		name    string
+		message string
+		fields  []zap.Field
+		want    string
+	}{
+		{
+			name:    "zap.Error field is appended",
+			message: "Query",
+			fields:  []zap.Field{zap.Error(queryErr)},
+			want:    `Query: ERROR: column "use_self_order" does not exist (SQLSTATE 42703)`,
+		},
+		{
+			name:    "err field is appended",
+			message: "Query",
+			fields:  []zap.Field{zap.Any("err", queryErr), zap.String("sql", "SELECT 1")},
+			want:    `Query: ERROR: column "use_self_order" does not exist (SQLSTATE 42703)`,
+		},
+		{
+			name:    "error field wins over err field",
+			message: "Query",
+			fields:  []zap.Field{zap.Any("err", errors.New("secondary")), zap.Error(errors.New("primary"))},
+			want:    "Query: primary",
+		},
+		{
+			name:    "message already containing the error is left alone",
+			message: "checkout failed: primary",
+			fields:  []zap.Field{zap.Error(errors.New("primary"))},
+			want:    "checkout failed: primary",
+		},
+		{
+			name:    "empty message becomes the error",
+			message: "",
+			fields:  []zap.Field{zap.Error(errors.New("primary"))},
+			want:    "primary",
+		},
+		{
+			name:    "no error field leaves the message untouched",
+			message: "checkout failed",
+			fields:  []zap.Field{zap.String("order_id", "42")},
+			want:    "checkout failed",
+		},
+		{
+			name:    "nil error is not appended",
+			message: "Query",
+			fields:  []zap.Field{zap.Error(nil)},
+			want:    "Query",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			client, tr := newTestClient()
+			core := bikeeperzap.NewCore(client, context.Background(), zapcore.DebugLevel)
+
+			entry := zapcore.Entry{Level: zapcore.ErrorLevel, Message: tt.message}
+			if err := core.Write(entry, tt.fields); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+
+			events := flushAndCapture(client, tr)
+			if len(events) != 1 {
+				t.Fatalf("want 1 event, got %d", len(events))
+			}
+			if events[0].Message != tt.want {
+				t.Errorf("Message = %q, want %q", events[0].Message, tt.want)
+			}
+		})
+	}
+}
+
+// The dashboard renders Exception.Value as the issue title, so it has to carry
+// the same folded-in error as the message.
+func TestCore_Write_ExceptionValueMatchesMessage(t *testing.T) {
+	t.Parallel()
+	client, tr := newTestClient()
+	core := bikeeperzap.NewCore(client, context.Background(), zapcore.DebugLevel)
+
+	entry := zapcore.Entry{Level: zapcore.ErrorLevel, Message: "Query"}
+	if err := core.Write(entry, []zap.Field{zap.Error(errors.New("connection refused"))}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	events := flushAndCapture(client, tr)
+	if len(events) != 1 {
+		t.Fatalf("want 1 event, got %d", len(events))
+	}
+	if events[0].Exception == nil {
+		t.Fatal("Exception should not be nil")
+	}
+	if got, want := events[0].Exception.Value, "Query: connection refused"; got != want {
+		t.Errorf("Exception.Value = %q, want %q", got, want)
+	}
+	if got := findTag(events[0], "error"); got != "connection refused" {
+		t.Errorf("error tag = %q, want %q", got, "connection refused")
 	}
 }
 

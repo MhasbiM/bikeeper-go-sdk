@@ -34,6 +34,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
 
 	bikeeper "github.com/MhasbiM/bikeeper-go-sdk"
 	"go.uber.org/zap"
@@ -98,7 +99,8 @@ func (c *Core) Check(entry zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.Che
 
 // Write converts the zap log entry and its accumulated fields into a Bikeeper
 // event. Structured zap fields are encoded into Bikeeper [bikeeper.Tag] values
-// so they appear in the dashboard's tag panel.
+// so they appear in the dashboard's tag panel, and a logged error is folded
+// into the event's message — see [messageWithError].
 func (c *Core) Write(entry zapcore.Entry, fields []zap.Field) error {
 	if c.client == nil {
 		return nil
@@ -106,7 +108,7 @@ func (c *Core) Write(entry zapcore.Entry, fields []zap.Field) error {
 	level := zapLevelToBikeeper(entry.Level)
 	allFields := append(c.fields, fields...) //nolint:gocritic // intentional append-to-slice
 	tags := fieldsToTags(allFields)
-	c.client.CaptureMessage(c.ctx, entry.Message, level, tags...)
+	c.client.CaptureMessage(c.ctx, messageWithError(entry.Message, tags), level, tags...)
 	return nil
 }
 
@@ -138,6 +140,51 @@ func zapLevelToBikeeper(lvl zapcore.Level) bikeeper.Level {
 		return bikeeper.LevelFatal
 	default:
 		return bikeeper.LevelInfo
+	}
+}
+
+// errorFieldKeys are the zap field names that conventionally carry the error
+// being logged, in the order they are preferred: "error" is the key
+// [zap.Error] uses, "err" is what several libraries pick instead (pgx's
+// tracelog among them).
+var errorFieldKeys = []string{"error", "err"}
+
+// messageWithError returns message with the logged error appended, so the
+// event describes the failure and not merely the operation that hit it.
+//
+// A log message is written for a viewer who can see the entry's fields next to
+// it, so libraries routinely log a bare verb ("Query") and leave the detail to
+// zap.Error. An event has no such adjacency: its message becomes the issue
+// title in the dashboard and the task title in downstream integrations, where
+// a hundred unrelated failures all reading "Query" are indistinguishable.
+// Appending the error keeps those titles apart without touching grouping,
+// which is computed from the exception type and stack frames rather than the
+// message.
+//
+// The message is returned unchanged when no error field is present, or when it
+// already contains the error text (a call site that formatted the error into
+// its own message should not have it repeated).
+func messageWithError(message string, tags []bikeeper.Tag) string {
+	errText := ""
+	for _, key := range errorFieldKeys {
+		for _, tag := range tags {
+			if tag.Key == key && tag.Value != "" && tag.Value != "<nil>" {
+				errText = tag.Value
+				break
+			}
+		}
+		if errText != "" {
+			break
+		}
+	}
+
+	switch {
+	case errText == "" || strings.Contains(message, errText):
+		return message
+	case message == "":
+		return errText
+	default:
+		return message + ": " + errText
 	}
 }
 
