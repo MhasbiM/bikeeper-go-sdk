@@ -66,6 +66,18 @@ func GetHubFromContext(ctx context.Context) *Hub {
 	return nil
 }
 
+// HasHub reports whether ctx carries a Hub, and therefore whether anything
+// started on it could ever be sent.
+//
+// Integrations use it to skip work that would be thrown away: a Span started
+// with no Hub in reach has no client, so it is built, tagged and dropped on
+// Finish. Cheaper than [GetHubFromContext], which allocates a hub scoped to
+// ctx — worth the distinction on a path that runs per query or per command.
+func HasHub(ctx context.Context) bool {
+	_, ok := ctx.Value(hubContextKey).(*Hub)
+	return ok
+}
+
 // scopeSnapshot returns the hub's current scope under the hub mutex.
 // CaptureException and CaptureMessage call this so they always see a consistent
 // scope even when WithScope is running concurrently on another goroutine.

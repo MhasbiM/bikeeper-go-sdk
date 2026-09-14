@@ -103,3 +103,23 @@ func TestNewScrubber_ExtraKeysAndNilEvent(t *testing.T) {
 		t.Errorf("scrub(nil) = %v, want nil", got)
 	}
 }
+
+func TestHasHub(t *testing.T) {
+	t.Parallel()
+	tr := &fakeTransport{}
+	client := newFakeClient(t, tr, bikeeper.Options{})
+
+	if bikeeper.HasHub(context.Background()) {
+		t.Error("a bare context carries no hub")
+	}
+
+	ctx, job := bikeeper.StartJob(context.Background(), client, "worker.tick")
+	if !bikeeper.HasHub(ctx) {
+		t.Error("StartJob should leave a hub on the context")
+	}
+	bikeeper.FinishJob(job, nil)
+
+	if ctx, _ := bikeeper.StartJob(context.Background(), nil, "worker.tick"); bikeeper.HasHub(ctx) {
+		t.Error("a disabled client installs no hub")
+	}
+}
