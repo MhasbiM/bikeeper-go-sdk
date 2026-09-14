@@ -123,3 +123,35 @@ func TestHasHub(t *testing.T) {
 		t.Error("a disabled client installs no hub")
 	}
 }
+
+// A disabled integration hands a nil *Client to everything downstream. None of
+// it may panic — the application's real work does not depend on monitoring.
+func TestNilClientIsInert(t *testing.T) {
+	t.Parallel()
+	var client *bikeeper.Client
+	ctx := context.Background()
+
+	client.SetTag("service", "self-order")
+	client.CaptureMessage(ctx, "boom", bikeeper.LevelError)
+	client.CaptureException(ctx, errors.New("boom"))
+	client.CaptureEventAsync(bikeeper.NewEvent(bikeeper.LevelError, "boom"))
+	client.SetFramework("fiber")
+	client.Flush()
+	client.Close()
+
+	if err := client.Capture(ctx, bikeeper.NewEvent(bikeeper.LevelError, "boom")); err != nil {
+		t.Errorf("Capture on a nil client = %v, want nil", err)
+	}
+	if got := client.Dropped(); got != 0 {
+		t.Errorf("Dropped() = %d, want 0", got)
+	}
+	if got := client.Framework(); got != "" {
+		t.Errorf("Framework() = %q, want empty", got)
+	}
+
+	// Spans still work as plain values, so instrumented code needs no guards.
+	span := bikeeper.StartSpan(ctx, "usecase.GetSetting")
+	span.SetTag("uuid_transaction", "x")
+	span.SetStatus(bikeeper.SpanStatusInternalError)
+	span.Finish()
+}
